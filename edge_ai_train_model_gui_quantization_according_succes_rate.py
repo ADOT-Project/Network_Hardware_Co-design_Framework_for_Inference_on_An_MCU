@@ -51,6 +51,27 @@ def _import_torch(attempts=4):
     raise last
 
 
+# ===================== DO NOT REORDER THESE IMPORTS =====================
+# torch must be imported BEFORE PyQt5. This is not style, it is the
+# difference between the application starting and not:
+#
+#   import torch; import PyQt5   -> works, 2 of 2
+#   import PyQt5; import torch   -> OSError: [WinError 1114] ... c10.dll,
+#                                   2 of 2   (measured 2026-09-27)
+#
+# PyQt5 puts its own Qt5/bin directory on the DLL search path when it
+# loads, and that directory ships msvcp140.dll 14.26.28720.3. torch is
+# built against a newer toolset -- System32 here has 14.50.35719.0 -- so
+# once PyQt5 has been imported first, torch resolves the stale copy and its
+# initialisers fail. Importing torch first lets it bind the good one; PyQt5
+# afterwards is harmless.
+#
+# This is almost certainly the whole WinError 1114 story in this project:
+# the abandoned PyInstaller build (see packaging/README.md) bundled DLLs and
+# hit it, and copying PyQt5's msvcp140.dll next to python.exe reproduces it
+# on demand, 3 of 3. An IDE's "organise imports" or a linter moving the
+# PyQt5 block above this line would break the app for every user.
+# ========================================================================
 torch = _import_torch()
 import torch.nn as nn
 import torch.optim as optim

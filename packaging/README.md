@@ -70,6 +70,21 @@ interpreter wins the search order, so the old copy shadowed System32's
 likely the same WinError 1114 that killed the PyInstaller build** — that one
 bundled DLLs as well.
 
+The same DLL explains the flaky import failures, and there the fix is in the
+application rather than the package: **torch must be imported before PyQt5.**
+PyQt5 puts its `Qt5/bin` on the DLL search path as it loads, that directory
+ships the old `msvcp140.dll`, and torch then resolves it instead of
+System32's. Measured 2026-09-27, deterministic in both directions:
+
+```
+import torch ; import PyQt5   ->  works,            2 of 2
+import PyQt5 ; import torch   ->  WinError 1114,    2 of 2
+```
+
+The main module's import block is ordered accordingly and carries a comment
+saying so. Anything else that imports it — a headless runner, a test — has
+to import the module before touching PyQt5.
+
 So `msvcp140.dll` comes from the target machine. Every Windows that has had
 any VC++ 2015-2022 redistributable installed has it, which in practice is
 every machine with Office, a game, a GPU driver or most desktop software. On
