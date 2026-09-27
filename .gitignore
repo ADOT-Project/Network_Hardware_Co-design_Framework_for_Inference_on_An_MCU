@@ -27,3 +27,21 @@ export/model_weights_int8.h
 export/test_samples.h
 export/test_samples_int16.h
 export/test_samples_int8.h
+
+# --- build artifacts (packaging/build.ps1) ---
+build/
+build_out/
+dist/
+*.pyc
+__pycache__/
+build_out_log.txt
+inno_log.txt
+
+# --- training output: every run writes its own timestamped folder ---
+export/
+
+# --- portable runtime (packaging/build_portable.ps1 rebuilds it) ---
+portable/
+
+# --- local firmware snapshots taken before overwriting the project ---
+firmware_backups/
