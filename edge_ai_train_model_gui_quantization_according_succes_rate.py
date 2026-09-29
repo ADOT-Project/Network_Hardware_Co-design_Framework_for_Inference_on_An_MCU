@@ -483,13 +483,27 @@ def device_spec_line(dev):
 CLA_ANCHOR = {"channels": 6, "input_h": 65, "input_w": 12, "classes": 3,
               "layers": 2, "pool_w": False, "mhz": 200.0, "ms": 73.0,
               "tasks": 1}
-# Held out of the fit on purpose: the same firmware rebuilt at 4 channels
-# and measured the same way, 2026-09-27. Nothing is solved from it -- it is
-# the only number here that is free to disagree, which is what makes it
-# worth quoting.
-CLA_VALIDATION = {"channels": 4, "input_h": 65, "input_w": 12, "classes": 3,
-                  "layers": 2, "pool_w": False, "mhz": 200.0, "ms": 34.0,
-                  "tasks": 1}
+# Held out of the fit on purpose: the same firmware rebuilt and measured the
+# same way, once smaller than the anchor and once larger. Nothing is solved
+# from either -- they are the only numbers here free to disagree, which is
+# what makes them worth quoting.
+#
+# They also show the model's one systematic weakness. The correction each
+# measurement asks of the hand count is not constant, it climbs with the
+# channel count: 3.96 at 4 channels, 4.48 at 6, 4.68 at 11. The single fitted
+# factor sits in the middle, so the model runs slow for small networks and
+# fast for large ones -- +13% and -4% at the two ends of a 4-to-11 channel,
+# 34-to-213 ms range. Worth knowing before quoting a figure far outside it,
+# and worth fixing in the primitive table rather than by re-fitting, if
+# anyone ever has the measurements to do it properly.
+CLA_VALIDATIONS = [
+    {"channels": 4, "input_h": 65, "input_w": 12, "classes": 3, "layers": 2,
+     "pool_w": False, "mhz": 200.0, "ms": 34.0, "tasks": 1,
+     "note": "BLDC, 3 classes, 2026-09-27"},
+    {"channels": 11, "input_h": 65, "input_w": 12, "classes": 2, "layers": 2,
+     "pool_w": False, "mhz": 200.0, "ms": 213.0, "tasks": 1,
+     "note": "MIMII fan 6 dB, 2 classes, 2026-09-28"},
+]
 MFCC_ANCHOR = {"input_h": 65, "input_w": 12, "sr": 16000, "n_fft": 512,
                "hop": 256, "n_mels": 40, "mhz": 200.0, "ms": 202.0,
                # not the 2*bins approximation the fallback uses: this is
@@ -764,32 +778,36 @@ CLA_TUNE = _solve_tune(CLA_ANCHOR)
 def _validation_error(v):
     """How far the model lands from a measurement it was NOT fitted to.
 
-    Deliberately not folded into the fit. A constant solved from two points
-    reproduces both and proves nothing; one point held back is the only
-    thing here that can be wrong, and therefore the only thing that says
-    the model works. Re-fitting on both would trade the evidence for a
-    smaller residual."""
+    Deliberately not folded into the fit. A constant solved from every point
+    reproduces every point and proves nothing; the ones held back are the
+    only numbers here that can be wrong, and therefore the only ones that
+    say whether the model works. Re-fitting on them would trade the evidence
+    for a smaller residual."""
     counts = stage_op_counts(v["channels"], v["layers"], v["input_h"],
                              v["input_w"], v["classes"], v["pool_w"])
     cycles = (_hand_count(counts, CLA_LEVELS) * CLA_TUNE
               + v["tasks"] * CLA_TASK_OVERHEAD * CLA_TUNE)
     predicted = 1000.0 * cycles / (v["mhz"] * 1e6)
-    return {"predicted_ms": predicted, "measured_ms": v["ms"],
-            "error_pct": 100.0 * (predicted - v["ms"]) / v["ms"]}
+    return dict(v, predicted_ms=predicted, measured_ms=v["ms"],
+                error_pct=100.0 * (predicted - v["ms"]) / v["ms"])
 
 
-VALIDATION = _validation_error(CLA_VALIDATION)
+VALIDATIONS = [_validation_error(v) for v in CLA_VALIDATIONS]
+# The band the held-out points actually span, which is the honest accuracy
+# claim -- not the anchor's zero residual.
+VALIDATION_BAND = (min(x["error_pct"] for x in VALIDATIONS),
+                   max(x["error_pct"] for x in VALIDATIONS))
 
 
 def validation_note():
     """The provenance line the screen owes the reader: what the cycle costs
-    were fitted on, and how well they predicted something they were not."""
-    v = CLA_VALIDATION
-    return (f"cycle costs from an unoptimised (-O0) build · "
-            f"validated on a held-out {v['channels']}-channel measurement: "
-            f"{VALIDATION['predicted_ms']:.1f} ms modelled vs "
-            f"{VALIDATION['measured_ms']:.0f} ms measured, "
-            f"{VALIDATION['error_pct']:+.0f}%")
+    were fitted on, and how well they predicted what they were not."""
+    lo, hi = VALIDATION_BAND
+    chans = sorted(v["channels"] for v in VALIDATIONS)
+    span = sorted(v["measured_ms"] for v in VALIDATIONS)
+    return (f"cycle costs from an unoptimised (-O0) build · held out of the "
+            f"fit: {chans[0]} and {chans[-1]} channels, {span[0]:.0f}-"
+            f"{span[-1]:.0f} ms measured · model lands {lo:+.0f}% to {hi:+.0f}%")
 # The C28x conv path has no measurement of its own, so it is hand-counted
 # with the same structure and corrected by the same factor: same compiler,
 # same optimisation level, same source. What separates the two cores is
@@ -2970,10 +2988,17 @@ class SetupDialog(QDialog):
             "cpu1.cmd) gives the CLA one combined pool: RAMLS_0_1_2_3_4, length "
             "0x2800. The C2000 is WORD-addressed, so that is 10240 x 16-bit "
             "words = 20 KB of storage (10240 int16 values).\n\n"
-            "Measured in Debug/dense_layer_cla.map with everything on the CLA: "
-            "6858 of those 10240 words are used (input_image 780, conv weights "
-            "390, FC weight 2016, workspace 2532, plus the now-unused "
-            "input_vector 672).\n\n"
+            "Checked against a real link, 11 channels and 2 classes, "
+            "everything on the CLA: the model says 9102 words and the firmware "
+            "allocates 9102 -- input_image 780, workspace 4642, fResult 4, "
+            "conv1 110, conv2 1100, FC weights 2464, fc_bias 2.\n\n"
+            "What the model can NOT see is a buffer the firmware declares and "
+            "it knows nothing about. One of those cost a link: input_vector[], "
+            "dead since the kernels were fused but still sized by "
+            "DENSE_LAYER_INPUT, was 672 words at 6 channels and 1232 at 11 -- "
+            "invisible here, and enough to push the pool 94 words over. It has "
+            "been removed. If a build overflows while this gauge says it fits, "
+            "look for another one before doubting the arithmetic.\n\n"
             "A separate 0x800 = 2048-word block (RAMLS5_PROG) holds CLA program "
             "code and is NOT part of this budget -- that one is nearly full "
             "(2042/2048).")
@@ -3828,7 +3853,10 @@ class EdgeAiGui(QMainWindow):
         just like int16_t (TI C28x: sizeof(char)==1 but CHAR_BIT==16).
         INT8 therefore buys NO memory on this target -- only INT16 vs FLOAT32
         differ. Verified against Debug/dense_layer_cla.map: workspace
-        (MAX_ELEMENTS=2532 int16) occupies 0x9E4 = 2532 address units."""
+        (MAX_ELEMENTS=2532 int16) occupies 0x9E4 = 2532 address units. That
+        reading is from the 6-channel BLDC build; a later .map shows a
+        different count for the same rule, since MAX_ELEMENTS scales with the
+        channel count."""
         return {"FLOAT32": 4, "INT16": 2, "INT8": 2}[mode]
 
     def get_cla_stage(self):
@@ -3854,8 +3882,9 @@ class EdgeAiGui(QMainWindow):
           stage runs there.
         * `feature_ram` is the MFCC front end's own working set (the raw
           slice, the log-mel frames, the FFT scratch). It is not part of the
-          model, but it is the largest thing on the C28x side -- 85 KB of the
-          204 KB on this board, measured as 0xa6c0 words in RAMGS_TOTAL_CNN --
+          model, but it is the largest thing on the C28x side -- 85 KB,
+          measured as 0xa6c0 words in RAMGS_TOTAL_CNN, against the 164 KB one
+          C28x reaches on this part (the device holds 204 KB in total) --
           and leaving it out is what made the CPU RAM gauge read zero in
           every configuration. It is charged to the CPU because the C28x is
           what runs mfcc_extract().
@@ -4625,8 +4654,9 @@ class EdgeAiGui(QMainWindow):
             f"({'OLCULEN' if t['measured'] else 'tahmin'})",
             f"MAC basi {t['mac_cost']['cla']:.0f} cevrim (CLA) / "
             f"{t['mac_cost']['cpu']:.0f} (C28x)"
-            + f" -- model {CLA_VALIDATION['channels']} kanalda "
-              f"%{VALIDATION['error_pct']:+.0f} sapmayla dogrulandi (-O0)"
+            + f" -- model, fit disi tutulan olcumlerde "
+              f"%{VALIDATION_BAND[0]:+.0f} .. %{VALIDATION_BAND[1]:+.0f} "
+              f"sapiyor (-O0 derleme)"
             + (" -- olculen inference suresinden" if t["infer_measured"]
                else " -- model varsayimi"),
         ]

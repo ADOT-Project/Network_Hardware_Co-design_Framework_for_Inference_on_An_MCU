@@ -147,11 +147,15 @@ check("and the C28x measurement agrees with it",
 # nothing; this one the model had no chance to fit, and it is the only
 # number in this file that can genuinely fail. Widening the tolerance to
 # make a change pass would be deleting the evidence, not fixing the model.
-check("held-out 4-channel measurement",
-      round(gui.VALIDATION["predicted_ms"], 1),
-      gui.CLA_VALIDATION["ms"], tol=gui.CLA_VALIDATION["ms"] * 0.20)
-check("...and its error stays where it was measured",
-      round(gui.VALIDATION["error_pct"]), 13, tol=4)
+for _v in gui.VALIDATIONS:
+    check(f"held-out {_v['channels']}-channel measurement (ms)",
+          round(_v["predicted_ms"], 1), _v["measured_ms"],
+          tol=_v["measured_ms"] * 0.20)
+# The band across the held-out points IS the accuracy claim. It is allowed
+# to be wide; it is not allowed to be quietly widened.
+_lo, _hi = gui.VALIDATION_BAND
+check("held-out error band, low end", round(_lo), -4, tol=4)
+check("held-out error band, high end", round(_hi), 13, tol=4)
 
 check("CLA costs more per MAC than the C28x",
       round(a["mac_cost"]["cla"] / a["mac_cost"]["cpu"], 2), 1.84, tol=0.2)
