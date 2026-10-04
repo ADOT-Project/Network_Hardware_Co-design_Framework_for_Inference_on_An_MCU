@@ -25,13 +25,15 @@ FIRMWARE = os.path.join(ROOT, "CNN_Inference_Edge-AI_with_CLA")
 
 # What definitions.h says at the commit this test was written against, used
 # when the submodule is not checked out.
-FALLBACK = {"IMAGE_H": 65, "IMAGE_W": 12, "NUM_FILTERS": 6, "NUM_CLASSES": 3,
-            "DENSE_LAYER_INPUT": 672, "DENSE_LAYER_WEIGHTS": 2016,
+FALLBACK = {"IMAGE_H": 65, "IMAGE_W": 12, "NUM_FILTERS": 9, "NUM_CLASSES": 2,
+            "DENSE_LAYER_INPUT": 1008, "DENSE_LAYER_WEIGHTS": 2016,
             "POOL1_OUT_H": 31, "POOL1_OUT_W": 10,
             "POOL2_OUT_H": 14, "POOL2_OUT_W": 8}
 # mfcc_extract.c's static buffers, as the linker counted them:
-# Debug/dense_layer_cla.map, RAMGS_TOTAL_CNN used = 0xa6c0 words = 85.4 KB.
-MAP_MFCC_KB = 85.4
+# Debug/dense_layer_cla.map, mfcc_extract.obj (.ebss): log_mel 0x1450 +
+# z 0x404 + tw4 0x400 + tw 0x400 + rev4 0x40 + 1 = 8389 words = 16.4 KB.
+# (The indexed version kept a float copy of the slice and came to 85.4 KB.)
+MAP_MFCC_KB = 16.4
 
 fails = []
 
@@ -48,9 +50,11 @@ def firmware_defines():
     """The simple `#define NAME <int>` lines of definitions.h. The derived
     ones (CONV1_OUT_H and friends) are expressions, so they are recomputed
     here from the literals rather than parsed."""
-    path = os.path.join(FIRMWARE, "definitions.h")
-    if not os.path.isfile(path):
-        print(f"definitions.h not found ({path}) -- using recorded values")
+    path = gui.project_file(FIRMWARE, "definitions.h")
+    if path is None:
+        print(f"definitions.h not found under {FIRMWARE} -- using recorded "
+              f"values, so the op counts below are NOT checked against the "
+              f"firmware")
         return dict(FALLBACK)
     text = open(path, encoding="utf-8", errors="replace").read()
     out = {}
@@ -93,72 +97,84 @@ check("window length (ms)", round(plan["window_ms"], 1), 1056.0, tol=0.1)
 mf = gui.mfcc_cost(plan)
 check("MFCC working set (KB) vs the .map", round(mf["ram_bytes"] / 1024, 1),
       MAP_MFCC_KB, tol=MAP_MFCC_KB * 0.10)
-# Second anchor: one pass of mfcc_extract() on this 65-frame configuration
-# was measured at 202 ms on a 200 MHz F28379D (Debug build). CYC_FLOP is
-# set from it, so the model has to reproduce it.
+# One pass of mfcc_extract() on this 65-frame configuration was measured at
+# 32.25 ms on a 200 MHz F28379D (-O0, code running from RAM, second window
+# onwards; from flash, where it runs now, about 35 ms -- to be re-measured). CYC_FLOP is solved from it, so the model has to reproduce it.
+# (With the anchor's own plan: it carries the header's real FEAT_MEL_NNZ,
+# 490, where the plan above falls back to 2 * bins = 514.)
+mf_anchor = gui.mfcc_cost(gui.feature_plan(gui.MFCC_ANCHOR["input_h"],
+                                           gui.MFCC_ANCHOR["input_w"],
+                                           gui.MFCC_ANCHOR))
 check("MFCC reproduces the measurement (ms)",
-      round(1000.0 * mf["cycles"] / 200e6, 1), gui.MFCC_ANCHOR["ms"], tol=1.0)
+      round(1000.0 * mf_anchor["cycles"] / 200e6, 2), gui.MFCC_ANCHOR["ms"],
+      tol=0.01)
+check("cycles per float op on the C28x", round(gui.CYC_FLOP, 2), 7.05,
+      tol=0.3)
 
-print("\nthe anchors, reproduced")
-# The cycle model is SOLVED from the anchors, so it has to give the measured
-# numbers back. Everything in the conv model is hand-counted off
-# dense_layer.cla except one fitted correction, CLA_TUNE.
-#
-# The inference anchor is the firmware as it stands: 6 channels, which
-# definitions.h states and the .map confirms three ways over (conv1_weights
-# 54 words = 9*1*F, conv2_weights 324 = 9*F*F, workspace 2536 =
-# F*(31*10 + 14*8)). Measured 2026-09-26 at 73 ms.
-a_cfg = gui.CLA_ANCHOR
-a_plan = gui.feature_plan(a_cfg["input_h"], a_cfg["input_w"],
+print("\nthe fitted measurements, reproduced")
+# The conv model is two prices per core, a MAC and an accumulation window,
+# SOLVED from the measurements marked "fit". It therefore has to give those
+# back; this only checks the algebra and the counts under it.
+K = gui.KERNEL_SETUP
+k_plan = gui.feature_plan(K["input_h"], K["input_w"],
                           {"sr": 16000, "n_fft": 512, "hop": 256,
                            "n_mels": 40})
-a = gui.pipeline_timing(a_plan, a_cfg["channels"], a_cfg["layers"],
-                        a_cfg["input_h"], a_cfg["input_w"], a_cfg["classes"],
-                        a_cfg["pool_w"],
-                        {"stages": [True, True], "dense": True},
-                        a_cfg["mhz"], a_cfg["mhz"])
-counts_a = gui.stage_op_counts(a_cfg["channels"], a_cfg["layers"],
-                               a_cfg["input_h"], a_cfg["input_w"],
-                               a_cfg["classes"], a_cfg["pool_w"])
-check("anchor MACs (6 channels)", sum(c["macs"] for c in counts_a), 108072)
-check("anchor accumulations", sum(c["windows"] for c in counts_a), 5067)
-check("CLA inference reproduces the measurement (ms)",
-      round(a["infer_ms"], 2), a_cfg["ms"], tol=0.05)
-check("effective cycles per MAC on the CLA",
-      round(a["mac_cost"]["cla"]), 135, tol=2)
-check("cycles per float op on the C28x", round(gui.CYC_FLOP, 1), 14.6,
-      tol=0.2)
-# The correction on the hand count, and the strongest evidence the model
-# describes the real code: the CLA measurement asks for 4.48 and the C28x
-# measurement -- different core, different kernel, taken independently --
-# asks for 4.88. One unoptimised build, one factor. If these ever part
-# company, the primitive table has stopped matching one of them.
-check("the fitted correction", round(gui.CLA_TUNE, 2), 4.48, tol=0.3)
-_P = gui.CPU_PRIMITIVES
-_bf = (10 * _P["fmul"] + 6 * _P["fadd"] + 4 * _P["load"] + 4 * _P["store"]
-       + 6 * _P["iadd"] + _P["loop"])          # one fft512 butterfly, by hand
-check("and the C28x measurement agrees with it",
-      round(16 * gui.CYC_FLOP / _bf, 2), round(gui.CLA_TUNE, 2), tol=0.6)
-# The CLA is the DEARER place to run this kernel -- index-heavy int16 code
-# on a narrow integer unit with no hardware loop. That falls out of the
-# primitive table, not out of a fitted difference: both cores carry the
-# same tune factor.
-# The held-out point. The anchor is fitted, so reproducing it proves
-# nothing; this one the model had no chance to fit, and it is the only
-# number in this file that can genuinely fail. Widening the tolerance to
-# make a change pass would be deleting the evidence, not fixing the model.
-for _v in gui.VALIDATIONS:
-    check(f"held-out {_v['channels']}-channel measurement (ms)",
-          round(_v["predicted_ms"], 1), _v["measured_ms"],
-          tol=_v["measured_ms"] * 0.20)
-# The band across the held-out points IS the accuracy claim. It is allowed
-# to be wide; it is not allowed to be quietly widened.
-_lo, _hi = gui.VALIDATION_BAND
-check("held-out error band, low end", round(_lo), -4, tol=4)
-check("held-out error band, high end", round(_hi), 13, tol=4)
+ALL = {"cla": {"stages": [True, True], "dense": True},
+       "cpu": {"stages": [False, False], "dense": False}}
+EXPECTED_OPS = {4: (55472, 3378), 9: (215532, 7598), 12: (359952, 10130)}
 
-check("CLA costs more per MAC than the C28x",
-      round(a["mac_cost"]["cla"] / a["mac_cost"]["cpu"], 2), 1.84, tol=0.2)
+
+def model_ms(channels, core):
+    r = gui.pipeline_timing(k_plan, channels, K["layers"], K["input_h"],
+                            K["input_w"], K["classes"], K["pool_w"],
+                            ALL[core], K["mhz"], K["mhz"])
+    return r
+
+
+for m in gui.KERNEL_MEASUREMENTS:
+    c = gui.stage_op_counts(m["channels"], K["layers"], K["input_h"],
+                            K["input_w"], K["classes"], K["pool_w"])
+    macs, wins = EXPECTED_OPS[m["channels"]]
+    check(f"{m['channels']:2d} channels: MACs", sum(x["macs"] for x in c), macs)
+    check(f"{m['channels']:2d} channels: accumulations",
+          sum(x["windows"] for x in c), wins)
+    if m["fit"]:
+        for core in ("cpu", "cla"):
+            check(f"{m['channels']:2d} channels, {core}: model == measured (ms)",
+                  round(model_ms(m["channels"], core)["infer_ms"], 4),
+                  m[core + "_ms"], tol=0.0005)
+
+print("\nwhat the fit says")
+# Not assertions about the silicon -- a record of what these measurements
+# gave, so that changing a measurement or a count shows up as a diff here.
+check("C28x cycles per MAC", round(gui.CPU_LEVELS["taps"], 2), 6.46, tol=0.1)
+check("C28x cycles per accumulation", round(gui.CPU_LEVELS["windows"], 1),
+      57.2, tol=1.5)
+check("CLA cycles per MAC", round(gui.CLA_LEVELS["taps"], 2), 8.10, tol=0.1)
+check("CLA cycles per accumulation", round(gui.CLA_LEVELS["windows"], 1),
+      48.0, tol=1.5)
+
+print("\nthe held-out measurement")
+# The fitted points prove nothing; this one the model had no chance to fit,
+# and it is the only number in this file that can genuinely fail. Widening
+# the tolerance to make a change pass would be deleting the evidence, not
+# fixing the model.
+for _v in gui.VALIDATIONS:
+    check(f"held-out {_v['channels']}-channel, {_v['core']} (ms)",
+          round(_v["predicted_ms"], 3), _v["measured_ms"],
+          tol=_v["measured_ms"] * 0.02)
+# The band across the held-out points IS the accuracy claim. It is not
+# allowed to be quietly widened.
+_lo, _hi = gui.VALIDATION_BAND
+check("held-out error band, low end (%)", round(_lo, 2), 0.0, tol=1.0)
+check("held-out error band, high end (%)", round(_hi, 2), 0.0, tol=1.0)
+
+# The CLA is still the dearer place to run the network, by much less than
+# it was (1.84x with the indexed kernels).
+_a = model_ms(9, "cla")
+check("CLA / C28x, effective cycles per MAC at 9 channels",
+      round(_a["mac_cost"]["cla"] / _a["mac_cost"]["cpu"], 3), 1.162,
+      tol=0.02)
 
 print("\npipelining rules")
 cla_all = {"stages": [True, True], "dense": True}
@@ -217,6 +233,117 @@ check("measured inference is used as given", round(ti["infer_ms"], 4),
 # MACs -- so tripling the measurement has to triple it
 check("and re-anchors cycles per MAC", round(ti["mac_cost"]["cla"], 1),
       round(t["mac_cost"]["cla"] * 3.0, 1), tol=0.1)
+
+print("\nonly tail plans can be picked")
+# The GUI lets the CLA stages be the END of the chain and nothing else.
+for bits, want in (("000", True), ("001", True), ("011", True), ("111", True),
+                   ("100", False), ("010", False), ("110", False),
+                   ("101", False)):
+    got = gui.is_tail_plan([b == "1" for b in bits])
+    if got != want:
+        fails.append(f"is_tail_plan({bits}) = {got}")
+    print(f"  {'ok  ' if got == want else 'FAIL'}  S1S2S3={bits} "
+          f"{'allowed' if got else 'refused'}")
+# every single click, from every allowed plan, has to land on an allowed one
+bad_moves = []
+for start in ("000", "001", "011", "111"):
+    for idx in range(3):
+        for to_cla in (True, False):
+            new, _ = gui.assign_keeping_tail([b == "1" for b in start],
+                                             idx, to_cla)
+            if not gui.is_tail_plan(new) or new[idx] != to_cla:
+                bad_moves.append((start, idx, to_cla, new))
+if bad_moves:
+    fails.append(f"assign_keeping_tail left a non-tail plan: {bad_moves}")
+print(f"  {'ok  ' if not bad_moves else 'FAIL'}  every click from an allowed "
+      f"plan gives an allowed plan")
+check("S1 to the CLA carries S2 and S3",
+      int(gui.assign_keeping_tail([False, False, False], 0, True)[0]
+          == [True, True, True]), 1)
+check("S3 to the C28x carries S1 and S2",
+      int(gui.assign_keeping_tail([True, True, True], 2, False)[0]
+          == [False, False, False]), 1)
+check("S2 to the C28x from all-CLA leaves S3 on the CLA",
+      int(gui.assign_keeping_tail([True, True, True], 1, False)[0]
+          == [False, False, True]), 1)
+
+print("\nwhere an export lands in the project")
+import shutil
+import tempfile
+
+_tmp = tempfile.mkdtemp()
+try:
+    def _touch(*parts, text="x"):
+        p = os.path.join(_tmp, *parts)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w") as fh:
+            fh.write(text)
+        return p
+
+    def _rel(p, base):
+        return os.path.relpath(p, base).replace(os.sep, "/")
+
+    # an export folder: the five files, flat
+    for _n in gui.PORTED_FILES:
+        _touch("embedded", _n, text="new " + _n)
+    _emb = os.path.join(_tmp, "embedded")
+
+    # 1. the structured project: main.c in the root, headers in application/include
+    _proj = os.path.join(_tmp, "structured")
+    _touch("structured", "main.c", text="old")
+    for _n in ("definitions.h", "weights.h", "cla_pipeline_config.h"):
+        _touch("structured", "application", "include", _n, text="old")
+    _touch("structured", "application", "source", "convolution.c")
+    _ok = gui._has_templates(_proj)
+    print(f"  {'ok  ' if _ok else 'FAIL'}  structured project is recognised")
+    if not _ok:
+        fails.append("structured project not recognised")
+    _done = sorted(gui.port_to_ccs(_emb, _proj))
+    _want = sorted(["main.c", "application/include/definitions.h",
+                    "application/include/weights.h",
+                    "application/include/cla_pipeline_config.h",
+                    # not in the project before: a header, so it goes with the others
+                    "application/include/feature_tables.h"])
+    print(f"  {'ok  ' if _done == _want else 'FAIL'}  files land where the "
+          f"project keeps them")
+    if _done != _want:
+        fails.append(f"port_to_ccs wrote {_done}, expected {_want}")
+    _stray = [n for n in gui.PORTED_FILES
+              if n != "main.c" and os.path.exists(os.path.join(_proj, n))]
+    print(f"  {'ok  ' if not _stray else 'FAIL'}  no header is written into "
+          f"the root")
+    if _stray:
+        fails.append(f"headers written into the project root: {_stray}")
+    _txt = open(os.path.join(_proj, "application", "include", "weights.h")).read()
+    check("the project's copy was replaced", int(_txt == "new weights.h"), 1)
+    check("no duplicates after a port",
+          len(gui.project_duplicates(_proj, gui.PORTED_FILES)), 0)
+
+    # 2. the old flat project still works
+    _flat = os.path.join(_tmp, "flat")
+    for _n in ("main.c", "definitions.h", "weights.h"):
+        _touch("flat", _n, text="old")
+    _done = sorted(gui.port_to_ccs(_emb, _flat))
+    check("flat project: everything in the root",
+          int(_done == sorted(gui.PORTED_FILES)), 1)
+
+    # 3. a header in two places is reported, by name
+    _touch("structured", "definitions.h", text="stale")
+    _d = gui.project_duplicates(_proj, gui.PORTED_FILES)
+    check("a duplicated header is detected", int(list(_d) == ["definitions.h"]), 1)
+finally:
+    shutil.rmtree(_tmp, ignore_errors=True)
+
+# and the real project, when it is checked out
+if os.path.isdir(FIRMWARE):
+    _d = gui.project_duplicates(FIRMWARE, gui.PORTED_FILES)
+    print(f"  {'ok  ' if not _d else 'FAIL'}  the checked-out project has one "
+          f"copy of each model file")
+    if _d:
+        fails.append(f"duplicate model files in the project: {_d}")
+    for _n in gui.PORTED_FILES:
+        print(f"        {_n:24s} -> "
+              f"{_rel(gui.project_target(FIRMWARE, _n), FIRMWARE)}")
 
 print("\ndevice catalogue")
 keys = [x["key"] for x in gui.C2000_DEVICES]

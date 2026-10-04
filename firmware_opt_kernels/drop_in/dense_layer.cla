@@ -1,0 +1,96 @@
+#include <cla_dense_layer_shared.h>
+#include "F2837xD_device.h"
+#include "definitions.h"
+#include "cla_pipeline_config.h"
+
+// CLA stages: conv1+relu+pool1, conv2+relu+pool2, dense.
+//
+// Each stage is compiled only when cla_pipeline_config.h marks it 1. That is
+// a requirement, not a preference: CLA program RAM (RAMLS5_PROG) is 2048
+// words. For the same reason all three stages share ONE task when they are
+// all on the CLA (CLA_SINGLE_TASK); with a stage on the CPU there is room for
+// a task per stage.
+//
+// The stage bodies come from fused_kernels_opt.h, the same file
+// convolution.c includes for the CPU twins (conv1_pool_fused_cpu /
+// conv2_pool_fused_cpu / dense_fc_cpu). One source, so the two cores cannot
+// compute different things.
+//
+// CODE SIZE: the 3x3 window is unrolled, which costs program words. If the
+// link fails with Cla1Prog not fitting RAMLS5_PROG, see
+// firmware_opt_kernels/README.md ("Cla1Prog sigmazsa").
+
+#if CLA_STAGE_CONV1_POOL1
+#pragma CODE_SECTION(conv1_pool_fused_cla, "Cla1Prog")
+#define KFN_CONV1  conv1_pool_fused_cla
+#endif
+
+#if CLA_STAGE_CONV2_POOL2
+#pragma CODE_SECTION(conv2_pool_fused_cla, "Cla1Prog")
+#define KFN_CONV2  conv2_pool_fused_cla
+#endif
+
+#include "fused_kernels_opt.h"
+
+
+#if CLA_SINGLE_TASK
+
+//
+// All three stages on the CLA: one task, one trigger.
+// Task 1: conv1_pool_fused -> conv2_pool_fused -> dense
+//
+// The CPU does not wait for it -- it starts the next window's MFCC while
+// this runs. GPIO67 is low for exactly as long as the CLA is busy.
+//
+#pragma CODE_SECTION(Cla1Task1, "Cla1Prog")
+__interrupt void Cla1Task1(void)
+{
+    GpioDataRegs.GPCCLEAR.bit.GPIO67 = 1;
+
+    // workspace[0 .. POOL1_SIZE-1]                      = pool1 output
+    conv1_pool_fused_cla(input_image, workspace, conv1_weights, conv1_bias);
+
+    // workspace[POOL1_SIZE .. POOL1_SIZE+POOL2_SIZE-1]  = pool2 output (dense input)
+    conv2_pool_fused_cla(workspace, &workspace[POOL1_SIZE], conv2_weights, conv2_bias);
+
+    K_DENSE_BODY(&workspace[POOL1_SIZE], weight, fc_bias, fResult)
+
+    GpioDataRegs.GPCSET.bit.GPIO67 = 1;
+}
+
+#else   // !CLA_SINGLE_TASK
+
+//
+// Mixed split: one task per stage.
+// Task1 = S1 (conv1+pool1), Task2 = S2 (conv2+pool2), Task3 = S3 (dense).
+// The numbers are tied to the stage (an unselected stage's task is not
+// compiled at all), so non-adjacent splits such as S1=CLA, S2=CPU, S3=CLA
+// work. main.c runs each stage either as a CPU function or with
+// Cla1ForceTaskNandWait().
+//
+
+#if CLA_STAGE_CONV1_POOL1
+#pragma CODE_SECTION(Cla1Task1, "Cla1Prog")
+__interrupt void Cla1Task1(void)
+{
+    conv1_pool_fused_cla(input_image, workspace, conv1_weights, conv1_bias);
+}
+#endif
+
+#if CLA_STAGE_CONV2_POOL2
+#pragma CODE_SECTION(Cla1Task2, "Cla1Prog")
+__interrupt void Cla1Task2(void)
+{
+    conv2_pool_fused_cla(workspace, &workspace[POOL1_SIZE], conv2_weights, conv2_bias);
+}
+#endif
+
+#if CLA_STAGE_DENSE
+#pragma CODE_SECTION(Cla1Task3, "Cla1Prog")
+__interrupt void Cla1Task3(void)
+{
+    K_DENSE_BODY(&workspace[POOL1_SIZE], weight, fc_bias, fResult)
+}
+#endif
+
+#endif  // CLA_SINGLE_TASK

@@ -19,6 +19,7 @@ import datetime
 import json
 import os
 import re
+import shutil
 import sys
 
 import numpy as np
@@ -77,7 +78,7 @@ import torch.nn as nn
 import torch.optim as optim
 from PyQt5.QtCore import QPointF, QRectF, Qt, QThread, QTimer, QUrl, pyqtSignal
 from PyQt5.QtGui import (QColor, QDesktopServices, QFont, QPainter,
-                         QPainterPath, QPen, QTextDocument)
+                         QIntValidator, QPainterPath, QPen, QTextDocument)
 from PyQt5.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog,
                              QFileDialog, QFrame, QGridLayout, QHBoxLayout,
                              QLabel, QLineEdit, QMainWindow, QProgressBar,
@@ -404,167 +405,84 @@ def device_spec_line(dev):
 # that actually takes the frame?
 #
 # The costs below are for the kernels this firmware really runs, not for a
-# datasheet peak. Both halves are ANCHORED to measurements taken on the
-# board (2026-09-26, 200 MHz F28379D, the Debug build in this repository):
+# datasheet peak, and every one of them is SOLVED from a time measured on the
+# board (2026-10-04, 200 MHz F28379D, -O0 build, 65x12 input, 2 classes,
+# GPIO-timed, MIMII fan 6 dB models):
 #
-#   inference  6 channels, 65x12 input, S1+S2+S3 in one CLA task, the
-#              GPIO67 toggle in Cla1Task1 -> 73 ms. 14.6 M cycles for
-#              108,072 MACs, i.e. 135 effective cycles a MAC.
-#   MFCC       one pass of mfcc_extract(), 65 frames, 512-point FFT,
-#              40 mel bands -> 202 ms. 40.4 M cycles for 2.74 M modelled
-#              float operations: 14.6 cycles each, which is CYC_FLOP.
+#   channels   feature extraction   inference, all C28x   inference, all CLA
+#       4          32.25 ms              2.760 ms              3.061 ms
+#       9          32.25 ms              9.089 ms             10.565 ms
+#      12          32.25 ms             14.532 ms             17.026 ms
 #
-# They were measured on different cores through different code, and each
-# asks the hand count for almost the same correction: 4.48 on the CLA, 4.88
-# on the C28x. One unoptimised build, one factor -- which is why CPU_TUNE is
-# allowed to borrow the CLA's. Hand-counting both kernels off the same
-# primitive table then puts a conv MAC at ~73 effective cycles on the C28x
-# against the CLA's measured 135: the CLA is about 1.8x the more expensive
-# place to run this kernel.
+# These are the pointer-walking kernels: fused_kernels_opt.h (3x3 window
+# written out, operands read through walking pointers, one source for both
+# cores) and the radix-4 real-input mfcc_extract.c. The indexed kernels
+# they replaced measured 70 ms (C28x) and 140 ms (CLA) at 9 channels, and
+# 203 ms for the MFCC -- same compiler, same -O0, same arithmetic. What
+# changed is the code around the multiply-add, and that is the finding worth
+# keeping: the CLA's old 2x handicap was index arithmetic and three-trip
+# loops, not the core. With those gone it runs the same network 11% to 17%
+# slower than the C28x.
 #
-# That is the opposite of what a datasheet suggests (same clock, same float
-# width) and it is not a paradox: this kernel is index arithmetic and int16
-# conversions wrapped around a multiply-add, and the C28x brings a 32-bit
-# integer ALU, RPTB hardware loops and richer addressing to exactly that,
-# where the CLA has a narrow integer side, no hardware loop and three delay
-# slots on every branch. So on this build the CLA does not make a stage
-# faster -- it makes it CONCURRENT, which is a different and often better
-# thing, and it is what the frame budget is there to show.
+# The conv model is two prices per core -- a MAC, and a completed
+# accumulation ("window": reset, bias, ReLU/pool compare, and its share of
+# the descale and store) -- because those are the only two things the
+# kernels do a number of times that scales differently with the channel
+# count. Both are solved from the 4- and 12-channel measurements; the
+# 9-channel one is held out and is the accuracy claim.
 #
-# CAVEAT, and it is a big one: both anchors are from the DEBUG build --
-# unoptimised code, nothing unrolled, CLA program RAM at 2042 of 2048 words.
-# They describe this firmware as it is today, not the silicon's ceiling. A
-# release build with unrolled taps and pointer walks instead of recomputed
-# uint32 indices would move every number here, so re-measure before quoting
-# any of it.
+# What three measurements can NOT separate, and the model therefore assumes:
+#   * a MAC costs the same in conv1, conv2 and the dense layer. conv2 wraps
+#     nine MACs in an in_c iteration that conv1 does not have; that tail is
+#     folded into the per-MAC price. Stage-by-stage times are the model's
+#     split of a measured TOTAL -- only the totals were measured.
+#   * one input size (65x12), one class count. A different window changes
+#     the ratio of MACs to accumulations, which is exactly what the two
+#     prices are for, but it has not been checked on the board.
+#   * -O0. An optimised build changes both prices and may stop them being
+#     constants at all; it needs its own measurements.
 #
-# 135 cycles for a multiply and an add wants explaining. The multiply and
-# the add are not the cost; everything around them is:
-#
-#   * the operands are int16 and the accumulator is float, so every MAC is
-#     two loads and two MI16TOF32 conversions before the MMPYF32/MADDF32
-#     (dense_layer.cla and convolution.c both do
-#     `sum += (float)input[..] * (float)filters[..]`);
-#   * the indices are uint32 expressions recomputed per iteration
-#     (`row_ptr + (c + fj)`, `filter_offset + fi*FILTER_SIZE + fj`), and the
-#     CLA is a float machine -- its integer side is narrow, so address
-#     arithmetic costs real instructions there;
-#   * there is no hardware loop on the CLA and MBCNDD carries three delay
-#     slots, so a three-iteration inner loop pays a branch tail per MAC;
-#   * and CLA program RAM is at 2042 of 2048 words, which means this is a
-#     build optimised for SIZE -- nothing is unrolled.
-#
-# The same three things are why a stage is priced per ACCUMULATION as well
-# as per MAC: each `sum` ends with a bias multiply-add, a ReLU compare, an
-# int16 conversion, a pool compare and -- the expensive one -- a float
-# DIVISION by the quantization scale, which neither core has an instruction
-# for (`sum / CONV1_WEIGHT_SCALE`, and `sum / FC_WEIGHT_SCALE` per class in
-# the dense stage).
-#
-# One effect pulls the other way and is folded into the C28x's price
-# already: a CPU stage reads its weights from flash with wait states, where
-# a CLA stage reads LS RAM in a single cycle. It is not enough to close a
-# 2.5x gap. Both prices stay editable, and typing a measured inference time
-# re-anchors them from the GUI without touching this file.
-# The two measurements, as DATA. Everything priced per MAC or per float
-# operation below is solved from these, so correcting one of them is a
-# one-line change and never a hunt for a magic number.
-#
-# The inference anchor is the build in CNN_Inference_Edge-AI_with_CLA: its
-# Cla1Task1 toggles GPIO67 around conv1+conv2+dense, which is what a scope
-# sees. Its channel count is not a guess -- the .map pins it down, since
-# NUM_FILTERS is baked into every weight array's size:
-#     _conv2_weights - _conv1_weights = 0x906d - 0x9037 =  54 words = 9*1*F
-#     _weight        - _conv2_weights = 0x91b1 - 0x906d = 324 words = 9*F*F
-#     _fc_bias       - _workspace     = 0x9028 - 0x8640 = 2536 words
-#                                     = F*POOL1 + F*POOL2
-# all three give F = 6, and that .map was built the same day as the .cla
-# file it describes.
-CLA_ANCHOR = {"channels": 6, "input_h": 65, "input_w": 12, "classes": 3,
-              "layers": 2, "pool_w": False, "mhz": 200.0, "ms": 73.0,
-              "tasks": 1}
-# Held out of the fit on purpose: the same firmware rebuilt and measured the
-# same way, once smaller than the anchor and once larger. Nothing is solved
-# from either -- they are the only numbers here free to disagree, which is
-# what makes them worth quoting.
-#
-# They also show the model's one systematic weakness. The correction each
-# measurement asks of the hand count is not constant, it climbs with the
-# channel count: 3.96 at 4 channels, 4.48 at 6, 4.68 at 11. The single fitted
-# factor sits in the middle, so the model runs slow for small networks and
-# fast for large ones -- +13% and -4% at the two ends of a 4-to-11 channel,
-# 34-to-213 ms range. Worth knowing before quoting a figure far outside it,
-# and worth fixing in the primitive table rather than by re-fitting, if
-# anyone ever has the measurements to do it properly.
-CLA_VALIDATIONS = [
-    {"channels": 4, "input_h": 65, "input_w": 12, "classes": 3, "layers": 2,
-     "pool_w": False, "mhz": 200.0, "ms": 34.0, "tasks": 1,
-     "note": "BLDC, 3 classes, 2026-09-27"},
-    {"channels": 11, "input_h": 65, "input_w": 12, "classes": 2, "layers": 2,
-     "pool_w": False, "mhz": 200.0, "ms": 213.0, "tasks": 1,
-     "note": "MIMII fan 6 dB, 2 classes, 2026-09-28"},
+# One thing that is NOT symmetric between the cores and is inside these
+# numbers: C28x code runs from flash (3 wait states at 200 MHz, prefetch
+# on), CLA code runs from RAM. Moving the MFCC to RAM made it 9% faster
+# (35 -> 32 ms); the C28x inference figures above are from flash.
+KERNEL_SETUP = {"input_h": 65, "input_w": 12, "classes": 2, "layers": 2,
+                "pool_w": False, "mhz": 200.0,
+                "note": "MIMII fan 6 dB, 2 classes, 2026-10-04"}
+# "fit": True  -> the two prices are solved from it
+# "fit": False -> held out; nothing is solved from it, so it is the only
+#                 row here free to disagree with the model
+KERNEL_MEASUREMENTS = [
+    {"channels": 4,  "cpu_ms": 2.7595,  "cla_ms": 3.0605,  "fit": True},
+    {"channels": 9,  "cpu_ms": 9.0890,  "cla_ms": 10.5645, "fit": False},
+    {"channels": 12, "cpu_ms": 14.5315, "cla_ms": 17.0260, "fit": True},
 ]
 MFCC_ANCHOR = {"input_h": 65, "input_w": 12, "sr": 16000, "n_fft": 512,
-               "hop": 256, "n_mels": 40, "mhz": 200.0, "ms": 202.0,
+               "hop": 256, "n_mels": 40, "mhz": 200.0, "ms": 32.25,
                # not the 2*bins approximation the fallback uses: this is
                # FEAT_MEL_NNZ out of the firmware's own feature_tables.h
                "mel_nnz": 490}
-# What the 200 ms window contains, since an anchor is only as good as the
-# thing it was measured around. main.c toggles GPIO18 over exactly two
-# statements: mfcc_extract(), and the 65x12 loop that scales its output by
-# INPUT_SCALE, clamps it and stores it as int16. That second loop is 0.06%
-# of the work, so the figure is mfcc_extract() and the model is right to
-# treat it as such.
+# What the 32.25 ms contains, since an anchor is only as good as the thing
+# it was measured around. main.c toggles GPIO18 over exactly two statements:
+# mfcc_extract(), and the 65x12 loop that scales its output by INPUT_SCALE,
+# clamps it and stores it as int16. It was measured on the second window
+# onwards -- the first call also builds the twiddle tables.
 #
-# Two things it is NOT, both of which would make it an over-estimate if you
-# ever compare against a live system:
-#   * the input is golden_inputs[], a const array in FLASH, and the
-#     function reads it twice -- 33,792 16-bit flash reads. With the
-#     prefetch buffer that is ~0.1% of the total, so it does not matter
-#     here, but an ADC buffer in RAM would be no slower.
-#   * there is no waiting for audio in it. The 1056 ms the window spans in
-#     real time is not part of this number, and must not be added to it:
-#     acquisition overlaps everything else.
-# Which channel count the inference figure belongs to took two rounds to
-# settle, and the wrong answer was argued for first. The committed
-# Debug/dense_layer_cla.map is a 6-channel build -- conv1_weights 54 words =
-# 9*1*F, conv2_weights 324 = 9*F*F, workspace 2536 = F*(31*10+14*8), and
-# definitions.h agrees -- but a plausibility argument was preferred over it:
-# the hand count below needed 1.8x to reach 70 ms at 10 channels against
-# 4.3x at 6, and 4.3x looked like the instruction counting being wrong.
+# CAUTION: 32.25 ms was measured while mfcc_extract() ran from RAM, through
+# a switch that has since been removed. The firmware now runs it from flash
+# like the rest of the C28x code, where it measured about 35 ms (a rounded
+# reading). Until that is re-measured to the same precision and typed in
+# here, the feature-extraction estimate is about 9% low.
 #
-# Re-measuring the firmware as it stands settled it: 6 channels, 73 ms. The
-# .map was right and the plausibility argument was not. Worth keeping as a
-# note to self -- a static fact about the binary beat a chain of reasoning
-# about what a number ought to be.
-#
-# The reading is now also self-consistent, which the other one was not. The
-# two measurements are on different cores through different code, and the
-# correction each one asks of the hand count comes out at 4.48 (CLA) and
-# 4.88 (C28x) -- one build, one optimisation level, one factor, agreeing to
-# within 9%. At 10 channels those were 1.81 and 4.88.
-
-# --- primitives ---------------------------------------------------------
-# What each core pays for one operation of the kernels in dense_layer.cla
-# and convolution.c, counted by hand from the instruction set. These set the
-# SHAPE of the estimate -- how conv1 compares to conv2, what another channel
-# count costs -- while their absolute level is corrected by the tune factor
-# solved from the measurement further down. Keeping the two apart is the
-# point: the structure comes from the code, the level from the board.
-#
-# The CLA and the C28x differ in exactly three of them, which is the whole
-# story of why the same C is slower on the CLA: integer adds, integer
-# multiplies and the loop tail. The C28x has a 32-bit integer ALU and RPTB
-# hardware loops; the CLA has a narrow integer side and MBCNDD's three delay
-# slots. The float and memory work is identical on both.
-_PRIM_COMMON = {"load": 1.0, "store": 1.0, "i2f": 1.0, "f2i": 2.0,
-                "fmul": 2.0, "fadd": 2.0, "div": 30.0}
-CLA_PRIMITIVES = dict(_PRIM_COMMON, iadd=3.0, imul=8.0, loop=6.0)
-CPU_PRIMITIVES = dict(_PRIM_COMMON, iadd=1.0, imul=2.0, loop=2.0)
+# There is no waiting for audio in it. The 1056 ms the window spans in real
+# time is not part of this number, and must not be added to it: acquisition
+# overlaps everything else.
 
 CYC_MISC = 1.5        # a compare or a store on its own
-CYC_LOG = 75.0        # log10f() from the RTS library
-CYC_SINCOS = 60.0     # one cosf + sinf pair (FFT twiddle seed, once per stage)
+CYC_LOG = 100.0       # power_db() in mfcc_extract.c: one division and a
+                      # short series. An estimate -- only the SAVING against
+                      # the library's log10f() was measured (about 300
+                      # cycles a call).
 CYC_DIV = 24.0        # float division
 CLA_TASK_OVERHEAD = 60.0   # trigger a Cla1TaskN and collect its result
 
@@ -604,40 +522,50 @@ def feature_plan(input_h, input_w, fcfg=None):
 
 def mfcc_ops(plan):
     """What one pass of mfcc_extract() has to do, counted, before anything
-    is priced: float operations, the library calls and divisions that are
-    not priced per flop, the FFT's share, and the working set.
+    is priced: float operations, the per-band and per-coefficient work that
+    is not priced per flop, the FFT's share, and the working set.
 
-    Follows that file statement by statement rather than quoting a headline
-    figure -- including the two places it is deliberately naive: the power
-    spectrum is recomputed inside the mel loop (once per non-zero weight,
-    not once per bin), and the FFT is a textbook radix-2 complex transform
-    on a real signal, which the file itself notes is roughly 10x the cost of
-    C2000Ware's RFFT_f32.
+    Follows that file loop by loop:
+
+      pass 1    window + complex packing + bit reversal + the first two FFT
+                stages (twiddles 1 and -j, no multiplies): a subtract and a
+                multiply per sample, then 16 add/subs per group of four
+                complex values.
+      radix-4   M = n_fft/2 complex points, M/4 butterflies a pass, each 12
+                multiplies and 22 add/subs. (log2(M) - 2) // 2 passes, and
+                one radix-2 pass more when M is not a power of 4.
+      unpack    one pair of FFT outputs gives two power bins: 20 flops.
+      mel       a multiply-add per non-zero weight, then one scale per band.
+      dct       a multiply-add per coefficient per band.
 
     Split out from mfcc_cost() so the flop price can be SOLVED from the
     measured anchor instead of being typed in."""
     n_fft, n_mels = plan["n_fft"], plan["n_mels"]
     n_frames, n_out = plan["n_frames"], plan["n_out"]
-    stages = max(1, int(round(np.log2(n_fft))))
-    butterflies = (n_fft // 2) * stages
+    m = n_fft // 2
+    stages2 = max(0, int(round(np.log2(m))) - 2)    # radix-2 stages after pass 1
+    r4_passes, r2_left = stages2 // 2, stages2 % 2
 
     # per frame
-    f_window = 2 * n_fft                    # windowed real part + zeroed imag
-    f_fft = 16 * butterflies                # 6 for the product, 4 for the
-                                            # add/sub pair, 6 for the twiddle
-                                            # recurrence
-    f_mel = 5 * plan["mel_nnz"]             # |X|^2 (3) + weighted accumulate (2)
-    f_dct = 2 * n_out * n_mels
-    flops = n_frames * (f_window + f_fft + f_mel + f_dct)
-    flops += 3 * plan["slice_len"]          # mean, subtract, scale
-    flops += 2 * n_frames * n_mels          # global max pass + floor pass
-    fixed = n_frames * (CYC_SINCOS * stages + CYC_LOG * n_mels
+    f_pass1 = 2 * n_fft + 4 * m
+    f_fft = r4_passes * (m // 4) * 34 + r2_left * (m // 2) * 10
+    f_unpack = 20 * (m // 2)
+    f_mel = 2 * plan["mel_nnz"] + n_mels
+    f_dct = 2 * n_out * n_mels + n_out
+    flops = n_frames * (f_pass1 + f_fft + f_unpack + f_mel + f_dct)
+    flops += plan["slice_len"]              # the integer sum for the mean
+    flops += 2 * n_frames * n_mels          # running max + the floor pass
+    fixed = n_frames * (CYC_LOG * n_mels
                         + n_out * (CYC_DIV + 2 * CYC_MISC))
-    # Working set: x[slice_len], log_mel[n_frames][n_mels], fft_re/im[n_fft],
-    # all float (4 storage bytes each on this target).
-    ram = 4 * (plan["slice_len"] + n_frames * n_mels + 2 * n_fft)
+    # Working set: log_mel[n_frames][n_mels], the FFT buffer z[n_fft + 2] and
+    # the two twiddle tables tw[n_fft], tw4[n_fft] -- all float, 4 storage
+    # bytes each on this target -- plus rev4[n_fft/8] at 2. The float copy
+    # of the whole slice that the indexed version kept (x[slice_len], 66 KB
+    # at 65 frames) is gone.
+    ram = 4 * (n_frames * n_mels + 3 * n_fft + 2) + 2 * (n_fft // 8)
     return {"flops": flops, "fixed_cycles": fixed,
-            "fft_flops": n_frames * f_fft, "ram_bytes": ram}
+            "fft_flops": n_frames * (f_pass1 + f_fft + f_unpack),
+            "ram_bytes": ram}
 
 
 def mfcc_cost(plan):
@@ -652,21 +580,20 @@ def stage_op_counts(ch, layers, ih, iw, ncls, pool_w):
     """What each pipeline stage has to compute, in the order the diagram
     draws them: one entry per fused conv+pool stage, then the dense stage.
 
-    One count per LOOP LEVEL of the kernels in dense_layer.cla, because the
-    levels cost different things and do not scale together -- conv2's
-    innermost tap is wrapped in an in_c loop that conv1 does not have, so a
-    model that only counts MACs gets the ratio between them wrong, and gets
-    it wrong differently at every channel count the search tries:
+    The two counts the timing model prices:
 
-      macs     `sum += (float)a[i] * (float)b[j]`    -- the fj body
-      taps     the same thing, named for what it is  -- an alias of macs
-      fi       one `row_ptr = (r + fi) * WIDTH`      -- once per 3 taps
-      inc      one in_c iteration: in_offset and filter_offset  (conv2 only)
-      windows  one completed accumulation: bias, ReLU, the float division,
-               the int16 conversion, the pool compare. For 2x1 pooling
-               there are two per pooled output -- the `sub` loop runs twice
-               before the kernel compares.
-      pooled   one stored output, with its own index arithmetic
+      macs     `sum += (float)*a++ * (float)*w++`  (`taps` is the same number)
+      windows  one completed accumulation: reset, the nine (or nine per
+               input channel) MACs, the bias add and the ReLU/pool compare.
+               For 2x1 pooling there are two per pooled output -- the `sub`
+               loop runs twice before the result is descaled and stored.
+
+    The rest describe the loop structure and are kept for the memory model
+    and for anyone refining the timing model with more measurements:
+
+      inc      one in_c iteration (conv2 only): nine MACs and a pointer step
+      fi       rows of the 3x3 window -- no longer a loop in the kernels
+      pooled   one stored output: one descale, one int16 conversion
       rows     one `pr` iteration, channels one `f` iteration
 
     Fused means the unpooled rows are never stored -- and never computed
@@ -701,8 +628,8 @@ def stage_op_counts(ch, layers, ih, iw, ncls, pool_w):
 
 
 # --------------------------------------------------------------------------
-# The two constants nothing above could state: solved from the anchors, now
-# that there is something to count the anchors' work with.
+# The constants nothing above could state: solved from the measurements, now
+# that there is something to count their work with.
 # --------------------------------------------------------------------------
 def _solve_flop_cycles(anchor):
     """Cycles per modelled float operation, from a measured MFCC time."""
@@ -712,89 +639,85 @@ def _solve_flop_cycles(anchor):
     return max(0.1, (target - o["fixed_cycles"]) / o["flops"])
 
 
-def level_costs(prim):
-    """What one iteration of each loop level costs, assembled from the
-    primitives -- i.e. the kernel read as instructions rather than as
-    mathematics. Straight off dense_layer.cla:
-
-      tap     `sum += (float)input[row_ptr + (c + fj)] *
-                      (float)filters[filter_offset + fi*FILTER_SIZE + fj]`
-              two loads, two int-to-float conversions, a multiply, an add,
-              two index adds (the multiply by FILTER_SIZE is constant and
-              strength-reduced), and the fj loop's own tail.
-      fi      `row_ptr = (r + fi) * WIDTH` -- an add, a multiply, a tail.
-      inc     in_offset and filter_offset, two multiplies and an add.
-      window  `sum = 0`, the bias multiply-add, the ReLU compare, the
-              DIVISION by the weight scale, the int16 conversion, the pool
-              compare, and the `sub` loop's tail.
-      pooled  the store, its index arithmetic, and the `c` loop's tail.
-    """
-    p = prim
-    return {
-        "taps": 2 * p["load"] + 2 * p["i2f"] + p["fmul"] + p["fadd"]
-                + 2 * p["iadd"] + p["loop"],
-        "fi": p["iadd"] + p["imul"] + p["loop"],
-        "inc": 2 * p["imul"] + p["iadd"] + p["loop"],
-        "windows": (p["load"] + p["i2f"] + p["fmul"] + p["fadd"]   # bias
-                    + p["fadd"]                                    # ReLU
-                    + p["div"] + p["f2i"] + p["fadd"] + p["loop"]),
-        "pooled": p["store"] + 2 * p["iadd"] + p["imul"] + p["loop"],
-        "rows": p["loop"],
-        "channels": 2 * p["imul"] + p["loop"],
-    }
+def _kernel_counts(channels):
+    k = KERNEL_SETUP
+    return stage_op_counts(channels, k["layers"], k["input_h"], k["input_w"],
+                           k["classes"], k["pool_w"])
 
 
-CLA_LEVELS = level_costs(CLA_PRIMITIVES)
-CPU_LEVELS = level_costs(CPU_PRIMITIVES)
+def _solve_kernel_costs(core):
+    """Cycles per MAC and per accumulation window on one core ("cpu" or
+    "cla"), from the two measurements marked "fit".
+
+    Two unknowns, two equations:  cycles = mac * MACs + window * windows.
+    The MAC count grows with channels squared (conv2) and the window count
+    linearly, so two channel counts far apart pin both down. On the CLA the
+    task overhead stage_cycles() adds is taken off first, so that the model
+    gives the measurement back exactly."""
+    rows = []
+    for m in KERNEL_MEASUREMENTS:
+        if not m["fit"]:
+            continue
+        counts = _kernel_counts(m["channels"])
+        cycles = m[core + "_ms"] / 1000.0 * KERNEL_SETUP["mhz"] * 1e6
+        if core == "cla":
+            cycles -= len(counts) * CLA_TASK_OVERHEAD
+        rows.append((float(sum(c["macs"] for c in counts)),
+                     float(sum(c["windows"] for c in counts)), cycles))
+    if len(rows) != 2:
+        raise ValueError("exactly two KERNEL_MEASUREMENTS must be marked fit")
+    (m1, w1, t1), (m2, w2, t2) = rows
+    det = m1 * w2 - m2 * w1
+    return {"taps": (t1 * w2 - t2 * w1) / det,
+            "windows": (m1 * t2 - m2 * t1) / det}
+
+
+CYC_FLOP = _solve_flop_cycles(MFCC_ANCHOR)
+# What one iteration of each priced loop level costs. Keyed like the counts
+# stage_op_counts() returns; a level that is not listed is not priced.
+CLA_LEVELS = _solve_kernel_costs("cla")
+CPU_LEVELS = _solve_kernel_costs("cpu")
+# Kept because pipeline_timing() multiplies by them. They were the single
+# fitted correction on a hand count when the model had one measurement; with
+# a measurement per core the level costs are fitted directly and these are 1.
+CLA_TUNE = 1.0
+CPU_TUNE = 1.0
 
 
 def _hand_count(counts, levels):
     return sum(sum(c.get(k, 0) * v for k, v in levels.items()) for c in counts)
 
 
-def _solve_tune(anchor):
-    """How much worse the compiled kernel is than the hand count above.
-
-    One number, from one measurement, and it is the only fitted quantity in
-    the conv model -- everything else is counted. It absorbs what cannot be
-    read off an instruction set: that this is an unoptimised build, that
-    locals live in memory rather than registers, and the pipeline stalls
-    that go with both. A value near 1 would mean the hand count was already
-    right; far from 1 means it is not, and the figure is worth looking at
-    rather than hiding, which is why the GUI reports it."""
-    counts = stage_op_counts(anchor["channels"], anchor["layers"],
-                             anchor["input_h"], anchor["input_w"],
-                             anchor["classes"], anchor["pool_w"])
-    hand = (_hand_count(counts, CLA_LEVELS)
-            + anchor["tasks"] * CLA_TASK_OVERHEAD)
-    target = anchor["ms"] / 1000.0 * anchor["mhz"] * 1e6
-    return max(0.1, target / hand) if hand > 0 else 1.0
+def stage_cycles(counts, on_cla):
+    levels = CLA_LEVELS if on_cla else CPU_LEVELS
+    tune = CLA_TUNE if on_cla else CPU_TUNE
+    return (_hand_count([counts], levels) * tune
+            + (CLA_TASK_OVERHEAD * CLA_TUNE if on_cla else 0.0))
 
 
-CYC_FLOP = _solve_flop_cycles(MFCC_ANCHOR)
-CLA_TUNE = _solve_tune(CLA_ANCHOR)
-
-
-def _validation_error(v):
+def _validation_error(m, core):
     """How far the model lands from a measurement it was NOT fitted to.
 
-    Deliberately not folded into the fit. A constant solved from every point
-    reproduces every point and proves nothing; the ones held back are the
-    only numbers here that can be wrong, and therefore the only ones that
-    say whether the model works. Re-fitting on them would trade the evidence
-    for a smaller residual."""
-    counts = stage_op_counts(v["channels"], v["layers"], v["input_h"],
-                             v["input_w"], v["classes"], v["pool_w"])
-    cycles = (_hand_count(counts, CLA_LEVELS) * CLA_TUNE
-              + v["tasks"] * CLA_TASK_OVERHEAD * CLA_TUNE)
-    predicted = 1000.0 * cycles / (v["mhz"] * 1e6)
-    return dict(v, predicted_ms=predicted, measured_ms=v["ms"],
-                error_pct=100.0 * (predicted - v["ms"]) / v["ms"])
+    Deliberately not folded into the fit. Prices solved from every point
+    reproduce every point and prove nothing; the one held back is the only
+    number here that can be wrong, and therefore the only one that says
+    whether the model works. Re-fitting on it would trade the evidence for a
+    smaller residual."""
+    on_cla = core == "cla"
+    cycles = sum(stage_cycles(c, on_cla) for c in _kernel_counts(m["channels"]))
+    predicted = 1000.0 * cycles / (KERNEL_SETUP["mhz"] * 1e6)
+    measured = m[core + "_ms"]
+    return {"channels": m["channels"], "core": core,
+            "note": KERNEL_SETUP["note"],
+            "predicted_ms": predicted, "measured_ms": measured,
+            "error_pct": 100.0 * (predicted - measured) / measured}
 
 
-VALIDATIONS = [_validation_error(v) for v in CLA_VALIDATIONS]
+VALIDATIONS = [_validation_error(m, core)
+               for m in KERNEL_MEASUREMENTS if not m["fit"]
+               for core in ("cpu", "cla")]
 # The band the held-out points actually span, which is the honest accuracy
-# claim -- not the anchor's zero residual.
+# claim -- not the fitted points' zero residual.
 VALIDATION_BAND = (min(x["error_pct"] for x in VALIDATIONS),
                    max(x["error_pct"] for x in VALIDATIONS))
 
@@ -803,28 +726,20 @@ def validation_note():
     """The provenance line the screen owes the reader: what the cycle costs
     were fitted on, and how well they predicted what they were not."""
     lo, hi = VALIDATION_BAND
-    chans = sorted(v["channels"] for v in VALIDATIONS)
+    fitted = sorted(m["channels"] for m in KERNEL_MEASUREMENTS if m["fit"])
+    held = sorted({v["channels"] for v in VALIDATIONS})
     span = sorted(v["measured_ms"] for v in VALIDATIONS)
-    return (f"cycle costs from an unoptimised (-O0) build · held out of the "
-            f"fit: {chans[0]} and {chans[-1]} channels, {span[0]:.0f}-"
-            f"{span[-1]:.0f} ms measured · model lands {lo:+.0f}% to {hi:+.0f}%")
-# The C28x conv path has no measurement of its own, so it is hand-counted
-# with the same structure and corrected by the same factor: same compiler,
-# same optimisation level, same source. What separates the two cores is
-# then the primitive table alone -- integer adds, integer multiplies, loop
-# tails -- rather than any fitted difference.
-CPU_TUNE = CLA_TUNE
+    return (f"cycle costs from a -O0 build, both cores measured · fitted on "
+            f"{fitted[0]} and {fitted[-1]} channels · held out: "
+            f"{', '.join(str(c) for c in held)} channels "
+            f"({span[0]:.1f}-{span[-1]:.1f} ms measured) · model lands "
+            f"{lo:+.1f}% to {hi:+.1f}%")
+
+
 # Reported, not used: cycles per MAC, for the parts of the GUI that quote a
 # single number.
 CYC_MAC_CLA = CLA_LEVELS["taps"] * CLA_TUNE
 CYC_MAC_CPU = CPU_LEVELS["taps"] * CPU_TUNE
-
-
-def stage_cycles(counts, on_cla):
-    levels = CLA_LEVELS if on_cla else CPU_LEVELS
-    tune = CLA_TUNE if on_cla else CPU_TUNE
-    return (_hand_count([counts], levels) * tune
-            + (CLA_TASK_OVERHEAD * CLA_TUNE if on_cla else 0.0))
 
 
 def pipeline_timing(plan, ch, layers, ih, iw, ncls, pool_w, cla_stage,
@@ -937,6 +852,43 @@ def pipeline_timing(plan, ch, layers, ih, iw, ncls, pool_w, cla_stage,
             "deadline_ms": period_ms, "window_ms": plan["window_ms"]}
 
 
+def is_tail_plan(flags):
+    """True when the CLA stages are a run at the END of the chain (or there
+    are none): once a stage is on the CLA, every later one is too.
+
+    `flags` is one bool per stage in execution order, dense last. These are
+    the only plans in which the CLA can run while the C28x has moved on to
+    the next window. A C28x stage AFTER a CLA stage needs that CLA stage's
+    result, so the C28x has to wait for it -- the stage has been moved to
+    the slower core and nothing overlaps."""
+    seen_cla = False
+    for on_cla in flags:
+        if seen_cla and not on_cla:
+            return False
+        seen_cla = seen_cla or bool(on_cla)
+    return True
+
+
+def assign_keeping_tail(flags, index, to_cla):
+    """`flags` with stage `index` moved to the CLA (to_cla) or the C28x, and
+    whatever else has to move so the result is still a tail plan:
+
+      to the CLA   -> every LATER stage goes to the CLA with it
+      to the C28x  -> every EARLIER stage goes to the C28x with it
+
+    Returns (new_flags, moved) where `moved` lists the other stages that
+    were carried along."""
+    out = [bool(f) for f in flags]
+    span = range(index, len(out)) if to_cla else range(0, index + 1)
+    moved = []
+    for i in span:
+        if out[i] != bool(to_cla):
+            out[i] = bool(to_cla)
+            if i != index:
+                moved.append(i)
+    return out, moved
+
+
 def timing_advice(t):
     """One sentence about where the frame actually goes, and what to do
     about it. Returns (severity, text) with severity in
@@ -948,9 +900,10 @@ def timing_advice(t):
                                            # chain offloaded
     gain = t["period_ms"] / full if full > 0 else 1.0
     cla_c, cpu_c = t["mac_cost"]["cla"], t["mac_cost"]["cpu"]
-    # On the measured build a MAC is about 2.5x dearer on the CLA, so
+    # A MAC costs more on the CLA than on the C28x (about 1.15x effective on
+    # the measured build; it was 2x before the kernels were rewritten), so
     # "offload it" is a trade, not a free win, and every branch below that
-    # recommends offloading has to say so.
+    # recommends offloading says so whenever the gap is 10% or more.
     slower = cla_c / cpu_c if cpu_c > 0 else 1.0
     trade = (f" The stages get slower there -- {slower:.1f}x per MAC on this "
              f"build -- so what you are buying is the overlap, not speed."
@@ -2019,6 +1972,66 @@ FIRMWARE_DIR = "CNN_Inference_Edge-AI_with_CLA"
 FIRMWARE_TEMPLATES = ("definitions.h", "weights.h", "main.c")
 
 
+# Where a firmware project may keep the files this tool reads and writes,
+# relative to the project folder. The project used to be flat (everything
+# next to main.c); it now keeps main.c in the root, headers in
+# application/include and sources in application/source. Both are accepted,
+# and so is the flat snapshot shipped inside a build.
+PROJECT_SUBDIRS = ("", os.path.join("application", "include"),
+                   os.path.join("application", "source"))
+
+
+def project_copies(project_dir, name):
+    """Every copy of `name` in the places a project may keep it."""
+    out = []
+    for sub in PROJECT_SUBDIRS:
+        p = os.path.join(project_dir, sub, name)
+        if os.path.isfile(p):
+            out.append(p)
+    return out
+
+
+def project_file(project_dir, name):
+    """The project's copy of `name`, or None when it has none."""
+    found = project_copies(project_dir, name)
+    return found[0] if found else None
+
+
+def project_target(project_dir, name):
+    """Where `name` belongs in this project: where it already is, and
+    otherwise where its kind goes -- headers in application/include when the
+    project has that folder, everything else (and everything in a flat
+    project) in the root."""
+    found = project_file(project_dir, name)
+    if found:
+        return found
+    inc = os.path.join(project_dir, "application", "include")
+    if name.endswith(".h") and os.path.isdir(inc):
+        return os.path.join(inc, name)
+    return os.path.join(project_dir, name)
+
+
+def project_duplicates(project_dir, files):
+    """{name: [paths]} for each of `files` the project holds more than once.
+
+    Two copies of a model header are worse than none. main.c sits in the
+    root and finds a header next to itself first; the kernels sit in
+    application/source and find the one in application/include. With a
+    different NUM_FILTERS in each, both translation units compile, the link
+    succeeds, and the two halves of the firmware disagree about every array
+    size. Nothing may be ported into a project in that state."""
+    out = {}
+    for name in files:
+        found = project_copies(project_dir, name)
+        if len(found) > 1:
+            out[name] = found
+    return out
+
+
+def _has_templates(cand):
+    return all(project_file(cand, f) for f in FIRMWARE_TEMPLATES)
+
+
 def find_firmware_templates():
     """Where to read definitions.h / weights.h / main.c from, in order of
     preference:
@@ -2041,9 +2054,57 @@ def find_firmware_templates():
                    os.path.join(app_dir(), FIRMWARE_DIR),
                    resource_path("firmware_templates")]
     for cand in candidates:
-        if all(os.path.isfile(os.path.join(cand, f)) for f in FIRMWARE_TEMPLATES):
+        if _has_templates(cand):
             return cand
     return None
+
+
+def find_ccs_project():
+    """The CCS project the export is ported into: the same search as
+    find_firmware_templates(), minus the snapshot shipped inside a build --
+    that one is read-only reference data, not a project anyone compiles.
+    None when there is no checkout to write to."""
+    candidates = []
+    env = os.environ.get("EDGE_AI_FIRMWARE_DIR")
+    if env:
+        candidates.append(env)
+    candidates += [os.path.join(os.getcwd(), FIRMWARE_DIR),
+                   os.path.join(app_dir(), FIRMWARE_DIR)]
+    for cand in candidates:
+        if _has_templates(cand):
+            return os.path.abspath(cand)
+    return None
+
+
+# What an export ports into the CCS project. The export folder keeps its own
+# copy of every one of them; the project only ever holds the latest model.
+PORTED_FILES = ("definitions.h", "weights.h", "main.c",
+                "cla_pipeline_config.h", "feature_tables.h")
+PORT_STAMP = "ADOT_LAST_EXPORT.txt"
+
+
+def port_to_ccs(embedded_dir, project_dir, files=PORTED_FILES):
+    """Replaces the project's copy of each file in `files` with the one in
+    embedded_dir, WHERE THE PROJECT KEEPS IT (see project_target): a header
+    that lives in application/include is replaced there, never written a
+    second time into the root. Each file is staged next to its target and
+    swapped in with os.replace, so an interrupted port never leaves a
+    half-written header for CCS to compile. Returns the ported files as
+    paths relative to the project, for the log.
+
+    Callers must check project_duplicates() first; this function ports into
+    whatever copy project_file() finds."""
+    done = []
+    for name in files:
+        src = os.path.join(embedded_dir, name)
+        if not os.path.isfile(src):
+            continue
+        dst = project_target(project_dir, name)
+        tmp = dst + ".adot_tmp"
+        shutil.copyfile(src, tmp)
+        os.replace(tmp, dst)
+        done.append(os.path.relpath(dst, project_dir).replace(os.sep, "/"))
+    return done
 
 
 def format_int_array_body(values):
@@ -2245,8 +2306,11 @@ class TrainingThread(QThread):
 
     def __init__(self, max_channels, layers, quant_mode, input_h, input_w,
                  num_classes, target_val, metric, pool_w, dataset_path,
-                 cla_stage, timing_note=None):
+                 cla_stage, timing_note=None, fixed_channels=None):
         super().__init__()
+        # None: search for the smallest robust width. An int: train exactly
+        # that width, for comparing against a searched model.
+        self.fixed_channels = fixed_channels
         # Lines the GUI's timing model produced for this plan, written into
         # cla_pipeline_config.h as a comment. Display only: nothing in the
         # search or the export depends on them.
@@ -2561,7 +2625,7 @@ class TrainingThread(QThread):
             # names them that way and hard-codes 2x1 pooling. Everything else
             # in the file is a formula over these, so the preprocessor
             # recomputes CONV*/POOL*/DENSE_LAYER_* sizes on its own.
-            defs = open(os.path.join(tpl, "definitions.h")).read()
+            defs = open(project_file(tpl, "definitions.h")).read()
             defs = patch_c_define(defs, "IMAGE_H", self.input_h)
             defs = patch_c_define(defs, "IMAGE_W", self.input_w)
             defs = patch_c_define(defs, "NUM_FILTERS", best_ch)
@@ -2582,7 +2646,7 @@ class TrainingThread(QThread):
             # IMAGE_H*IMAGE_W from definitions.h. fc_weights here is the
             # "for consistency" copy -- the FC weights the CLA actually reads
             # are main.c's weight[], patched below.
-            wts = open(os.path.join(tpl, "weights.h")).read()
+            wts = open(project_file(tpl, "weights.h")).read()
             for name, q, s in (("conv1_weights", w1q, w1s),
                                 ("conv1_bias", b1q, b1s),
                                 ("conv2_weights", w2q, w2s),
@@ -2597,7 +2661,7 @@ class TrainingThread(QThread):
             # ---- main.c: the CLA-resident copy of the dense weights --------
             # Only weight[] is data; the MFCC call, ADC/DMA setup, golden
             # vector loop and CLA task trigger are left byte-identical.
-            mc = open(os.path.join(tpl, "main.c")).read()
+            mc = open(project_file(tpl, "main.c")).read()
             mc = patch_c_array(mc, "const int16_t weight", "DENSE_LAYER_WEIGHTS", fcw_q)
             with open(f"{embedded_dir}/main.c", "w") as f:
                 f.write(mc)
@@ -2609,8 +2673,10 @@ class TrainingThread(QThread):
 
         with open(f"{embedded_dir}/README.txt", "w") as f:
             f.write(
-                "Copy the files in this folder into CNN_Inference_Edge-AI_with_CLA/,\n"
-                "overwriting the existing ones, then Project > Clean + Build in CCS:\n"
+                "The GUI copies these files into CNN_Inference_Edge-AI_with_CLA/\n"
+                "itself at the end of every export (see ADOT_LAST_EXPORT.txt there).\n"
+                "To go back to THIS model later, copy them over again by hand,\n"
+                "then Project > Clean + Build in CCS:\n"
                 "  definitions.h, weights.h, main.c   -- this model's weights/scales\n"
                 "  cla_pipeline_config.h              -- CPU/CLA stage split\n"
                 + ("  feature_tables.h                   -- MFCC tables, mu/sigma of\n"
@@ -2628,8 +2694,65 @@ class TrainingThread(QThread):
         self.update_signal.emit(
             f"<span style='color:{C_OK};'>embedded/ ready: definitions.h, "
             f"weights.h, main.c, cla_pipeline_config.h"
-            + (f", {ft_note}" if ft_note else "")
-            + f" -- copy into {FIRMWARE_DIR}/ and rebuild.</span>")
+            + (f", {ft_note}" if ft_note else "") + "</span>")
+        self.port_embedded(embedded_dir, best_ch, bool(ft_note))
+
+    def port_embedded(self, embedded_dir, best_ch, has_tables):
+        """Puts this model straight into the CCS project, replacing whatever
+        model was there. Only reached once all the model-bearing files were
+        generated: porting cla_pipeline_config.h alone would leave the
+        project's old weights compiled against a new stage split. The export
+        folder is untouched -- every run keeps its own copy there."""
+        project = find_ccs_project()
+        if project is None:
+            self.update_signal.emit(
+                f"<span style='color:{C_WARN};'>No {FIRMWARE_DIR}/ project "
+                f"found to port into (set EDGE_AI_FIRMWARE_DIR to point at "
+                f"one) -- the files are only in {embedded_dir}.</span>")
+            return
+        dups = project_duplicates(project, PORTED_FILES)
+        if dups:
+            listing = "; ".join(
+                f"{name}: " + ", ".join(
+                    os.path.relpath(p, project).replace(os.sep, "/")
+                    for p in paths)
+                for name, paths in dups.items())
+            self.update_signal.emit(
+                f"<span style='color:{C_ERR};'><b>Not ported:</b> {project} "
+                f"holds more than one copy of a model file ({listing}). "
+                f"main.c and the kernels would each compile against a "
+                f"different one. Delete the copy the project does not use, "
+                f"then export again. The export itself is complete in "
+                f"{embedded_dir}.</span>")
+            return
+        try:
+            done = port_to_ccs(embedded_dir, project)
+            with open(os.path.join(project, PORT_STAMP), "w",
+                      encoding="utf-8") as f:
+                f.write(
+                    "Bu klasordeki model dosyalari ADOT tarafindan son "
+                    "export'tan kopyalandi -- her egitimde uzerine yazilir.\n"
+                    f"tarih   : {datetime.datetime.now():%Y-%m-%d %H:%M:%S}\n"
+                    f"export  : {os.path.dirname(embedded_dir)}\n"
+                    f"dataset : {os.path.basename(self.dataset_path)}\n"
+                    f"kanal   : {best_ch}"
+                    + (" (sabit, karsilastirma)" if self.fixed_channels else "")
+                    + f"\ndosyalar: {', '.join(done)}\n")
+        except OSError as e:
+            self.update_signal.emit(
+                f"<span style='color:{C_ERR};'>Porting to {project} failed: "
+                f"{e}. Is a file open/locked in CCS? The export itself is "
+                f"complete in {embedded_dir}.</span>")
+            return
+        self.update_signal.emit(
+            f"<span style='color:{C_OK};'><b>Ported to CCS:</b> "
+            f"{', '.join(done)} &rarr; {project} (previous model replaced). "
+            f"Project &gt; Clean + Build in CCS before flashing.</span>")
+        if not has_tables:
+            self.update_signal.emit(
+                f"<span style='color:{C_WARN};'>feature_tables.h was not "
+                f"generated, so the project still has the one from an earlier "
+                f"export -- its mu/sigma may belong to another dataset.</span>")
 
     # ----------------------------------------------------------------- run
     def run(self):
@@ -2652,8 +2775,12 @@ class TrainingThread(QThread):
             # tekrar denerken eski sonuclar USTUNE YAZILMAZ, hepsi export/
             # altinda ayri ayri durur.
             ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            # a fixed-width run says so in its folder name, so a comparison
+            # model is never mistaken for a searched one
+            fx = (f"__fixed{self.fixed_channels}ch" if self.fixed_channels
+                  else "")
             self.out_dir = os.path.join(output_root(), "export",
-                                        f"{stem}__{tag}__{ts}")
+                                        f"{stem}__{tag}{fx}__{ts}")
             os.makedirs(self.out_dir, exist_ok=True)
             data, tr, va = self.load_data()
             self.update_signal.emit(
@@ -2663,71 +2790,98 @@ class TrainingThread(QThread):
                 + ", ".join(f"{c}={w:.2f}" for c, w in
                             zip([str(x) for x in data["classes"]], self.class_w.tolist())))
 
-            best_model, best_ch, target_met = None, self.max_channels, False
-            best_seen = -1.0
-
-            self.update_signal.emit(
-                f"<br><b>[2/4] Architecture search &mdash; target "
-                f"{self.metric} >= {self.target_val}%</b>")
-
-            self.emit_progress(phase="Phase 1 · coarse search")
-            self.update_signal.emit(
-                f"<br><span style='color:{C_ACCENT};'><b>--- PHASE 1: coarse search "
-                "(10-channel steps) ---</b></span>")
-            ch = min(10, self.max_channels)
-            while True:
+            if self.fixed_channels:
+                # Comparison run: the channel count is the user's, so there is
+                # nothing to search. One robustness-checked training at that
+                # width, scored the same way the search scores a candidate,
+                # and exported exactly like a searched model.
+                ch = self.fixed_channels
+                self.emit_progress(phase=f"Fixed · {ch} channels")
                 self.update_signal.emit(
-                    f"<br><i>Trying {ch} channels ({N_SEEDS} seeds x clean+perturbed val, "
-                    f"worst-case scored)...</i>")
+                    f"<br><b>[2/4] Fixed channel count &mdash; {ch} channels, "
+                    f"no search</b> (target {self.metric} >= "
+                    f"{self.target_val}% is only reported)")
+                if ch > self.max_channels:
+                    self.update_signal.emit(
+                        f"<span style='color:{C_WARN};'>{ch} channels is above "
+                        f"the memory ceiling ({self.max_channels}) -- trained "
+                        f"for comparison, but it will not fit the budgets."
+                        f"</span>")
                 m, clean, s = self.robust_train_and_score(ch, tr, va)
-                best_seen = max(best_seen, s)
-                self.emit_progress(best=best_seen)
+                self.emit_progress(best=s)
+                target_met = s >= self.target_val
                 self.update_signal.emit(
-                    f"  clean {clean:.1f}% | robust (worst-case) {s:.1f}%")
-                if s >= self.target_val:
-                    self.update_signal.emit(
-                        f"<span style='color:{C_OK};'><b>Target met at {ch} channels "
-                        f"&mdash; phase 2</b></span>")
-                    best_model, best_ch, target_met = m, ch, True
-                    break
-                if ch >= self.max_channels:
-                    best_model, best_ch = m, ch
-                    break
-                ch = min(ch + 10, self.max_channels)
+                    f"  clean {clean:.1f}% | robust (worst-case) {s:.1f}% "
+                    + (f"<span style='color:{C_OK};'>meets the target</span>"
+                       if target_met else
+                       f"<span style='color:{C_ERR};'>below the target</span>"))
+                best_model, best_ch = m, ch
+            else:
+                best_model, best_ch, target_met = None, self.max_channels, False
+                best_seen = -1.0
 
-            if target_met and best_ch > 1:
-                self.emit_progress(phase="Phase 2 · shrinking")
                 self.update_signal.emit(
-                    f"<br><span style='color:{C_WARN};'><b>--- PHASE 2: step-by-step "
-                    "reduction ---</b></span>")
-                for fine in range(best_ch - 1, max(0, best_ch - 10), -1):
-                    self.update_signal.emit(f"<br><i>{fine} channels...</i>")
-                    m, clean, s = self.robust_train_and_score(fine, tr, va)
+                    f"<br><b>[2/4] Architecture search &mdash; target "
+                    f"{self.metric} >= {self.target_val}%</b>")
+
+                self.emit_progress(phase="Phase 1 · coarse search")
+                self.update_signal.emit(
+                    f"<br><span style='color:{C_ACCENT};'><b>--- PHASE 1: coarse search "
+                    "(10-channel steps) ---</b></span>")
+                ch = min(10, self.max_channels)
+                while True:
                     self.update_signal.emit(
-                        f"  clean {clean:.1f}% | robust (worst-case) {s:.1f}%")
-                    if s < self.target_val:
-                        self.update_signal.emit(
-                            f"<span style='color:{C_ERR};'>Robust target failed at {fine} "
-                            f"channels ({s:.1f}%). Smallest viable: {best_ch} channels.</span>")
-                        break
-                    if s < best_seen - DEGRADE_TOL:
-                        self.update_signal.emit(
-                            f"<span style='color:{C_ERR};'>{fine} channels still meet the "
-                            f"robust target ({s:.1f}%) but drop more than {DEGRADE_TOL} pts "
-                            f"below the best seen ({best_seen:.1f}%). Stopping at "
-                            f"{best_ch} channels.</span>")
-                        break
-                    self.update_signal.emit(
-                        f"<span style='color:{C_OK};'>{fine} channels also robust "
-                        f"({s:.1f}%), continuing to shrink</span>")
-                    best_model, best_ch = m, fine
+                        f"<br><i>Trying {ch} channels ({N_SEEDS} seeds x clean+perturbed val, "
+                        f"worst-case scored)...</i>")
+                    m, clean, s = self.robust_train_and_score(ch, tr, va)
                     best_seen = max(best_seen, s)
                     self.emit_progress(best=best_seen)
+                    self.update_signal.emit(
+                        f"  clean {clean:.1f}% | robust (worst-case) {s:.1f}%")
+                    if s >= self.target_val:
+                        self.update_signal.emit(
+                            f"<span style='color:{C_OK};'><b>Target met at {ch} channels "
+                            f"&mdash; phase 2</b></span>")
+                        best_model, best_ch, target_met = m, ch, True
+                        break
+                    if ch >= self.max_channels:
+                        best_model, best_ch = m, ch
+                        break
+                    ch = min(ch + 10, self.max_channels)
 
-            if not target_met:
-                self.update_signal.emit(
-                    f"<br><span style='color:{C_ERR};'><b>Target not reached within hardware "
-                    "limits; exporting best attempt.</b></span>")
+                if target_met and best_ch > 1:
+                    self.emit_progress(phase="Phase 2 · shrinking")
+                    self.update_signal.emit(
+                        f"<br><span style='color:{C_WARN};'><b>--- PHASE 2: step-by-step "
+                        "reduction ---</b></span>")
+                    for fine in range(best_ch - 1, max(0, best_ch - 10), -1):
+                        self.update_signal.emit(f"<br><i>{fine} channels...</i>")
+                        m, clean, s = self.robust_train_and_score(fine, tr, va)
+                        self.update_signal.emit(
+                            f"  clean {clean:.1f}% | robust (worst-case) {s:.1f}%")
+                        if s < self.target_val:
+                            self.update_signal.emit(
+                                f"<span style='color:{C_ERR};'>Robust target failed at {fine} "
+                                f"channels ({s:.1f}%). Smallest viable: {best_ch} channels.</span>")
+                            break
+                        if s < best_seen - DEGRADE_TOL:
+                            self.update_signal.emit(
+                                f"<span style='color:{C_ERR};'>{fine} channels still meet the "
+                                f"robust target ({s:.1f}%) but drop more than {DEGRADE_TOL} pts "
+                                f"below the best seen ({best_seen:.1f}%). Stopping at "
+                                f"{best_ch} channels.</span>")
+                            break
+                        self.update_signal.emit(
+                            f"<span style='color:{C_OK};'>{fine} channels also robust "
+                            f"({s:.1f}%), continuing to shrink</span>")
+                        best_model, best_ch = m, fine
+                        best_seen = max(best_seen, s)
+                        self.emit_progress(best=best_seen)
+
+                if not target_met:
+                    self.update_signal.emit(
+                        f"<br><span style='color:{C_ERR};'><b>Target not reached within hardware "
+                        "limits; exporting best attempt.</b></span>")
 
             self.optimal_arch_found_signal.emit(best_ch)
 
@@ -2841,6 +2995,10 @@ class TrainingThread(QThread):
                 f.write(f"dataset: {self.dataset_path}\n")
                 f.write(f"quant: {self.quant_mode} | channels: {best_ch} | "
                         f"layers: {self.layers} | pool_w: {self.pool_w}\n")
+                f.write("channel count: "
+                        + ("FIXED by hand for comparison (no search)\n"
+                           if self.fixed_channels else
+                           f"searched (memory ceiling {self.max_channels})\n"))
                 cla_on = [name for name, on in (
                     ("S1 conv1+pool1", cs['stages'][0]),
                     ("S2 conv2+pool2", cs['stages'][1] and self.layers > 1),
@@ -2876,6 +3034,7 @@ class TrainingThread(QThread):
                 "quant": self.quant_mode, "q_acc": q_acc, "q_f1": q_f1,
                 "metric": self.metric, "target": self.target_val,
                 "target_met": target_met,
+                "fixed": bool(self.fixed_channels),
                 "classes": classes, "cm": cm.tolist(),
                 "out_dir": self.out_dir,
             })
@@ -2979,10 +3138,10 @@ class SetupDialog(QDialog):
             "Debug/dense_layer_cla.map.")
         self._edits["cpu"].setToolTip(
             "SRAM one C28x can reach. The MFCC front end is charged against "
-            "this budget -- its buffers (the raw slice, the log-mel frames and "
-            "the FFT scratch) are the largest single item on the CPU side, "
-            "~85 KB for a 65-frame window, which is why the C28x RAM and not "
-            "the CLA RAM is what a small part runs out of first.")
+            "this budget -- its buffers (the log-mel frames, the FFT buffer "
+            "and its twiddle tables) come to ~16 KB for a 65-frame window. "
+            "The front end no longer keeps a float copy of the raw slice, "
+            "which is what used to make this ~85 KB.")
         self._edits["cla"].setToolTip(
             "CNN_Inference_Edge-AI_with_CLA's linker script (2837xD_FLASH_CLA_lnk_"
             "cpu1.cmd) gives the CLA one combined pool: RAMLS_0_1_2_3_4, length "
@@ -3000,8 +3159,8 @@ class SetupDialog(QDialog):
             "been removed. If a build overflows while this gauge says it fits, "
             "look for another one before doubting the arithmetic.\n\n"
             "A separate 0x800 = 2048-word block (RAMLS5_PROG) holds CLA program "
-            "code and is NOT part of this budget -- that one is nearly full "
-            "(2042/2048).")
+            "code and is NOT part of this budget -- 1294 of 2048 words with "
+            "all three stages on the CLA.")
         lay.addWidget(mem)
 
         # --------------------------------------------------------- timing
@@ -3017,8 +3176,8 @@ class SetupDialog(QDialog):
             "RAM. Charged against the CPU RAM budget, because on a small "
             "part it -- not the network -- is what runs out of room first.\n\n"
             "Empty: this project's MFCC buffers, derived from the window "
-            "(the raw slice, the log-mel frames and the FFT scratch; 80 KB "
-            "for a 65-frame window, against 85 KB in the .map). Type your "
+            "(the log-mel frames, the FFT buffer and its tables; 16 KB for "
+            "a 65-frame window, which is what the .map shows). Type your "
             "own if your front end is not that one.")
         tim.add(self._field("infer", "Inference (ms):",
                             "" if cfg.get("infer_ms") is None
@@ -3392,6 +3551,31 @@ class EdgeAiGui(QMainWindow):
         lay.addLayout(self._field(self.timing_check, self.fe_edit))
         self._timing_toggled(False)
 
+        # Comparison runs: train one width of the user's choosing instead of
+        # searching. Same pattern as the timing option -- the checkbox is the
+        # caption, and off means the search decides.
+        self.fixed_edit = QLineEdit()
+        self.fixed_edit.setFixedWidth(88)
+        self.fixed_edit.setFixedHeight(32)
+        self.fixed_edit.setAlignment(Qt.AlignCenter)
+        self.fixed_edit.setPlaceholderText("not set")
+        self.fixed_edit.setValidator(QIntValidator(1, 512, self.fixed_edit))
+        self.fixed_edit.setToolTip(
+            "Channel count to train, for comparing against the searched "
+            "model. Any width is accepted -- one above the memory ceiling is "
+            "still trained, with a warning, so it can be compared.")
+        self.fixed_edit.editingFinished.connect(self.refresh)
+        self.fixed_check = QCheckBox("FIXED CHANNELS")
+        self.fixed_check.setToolTip(
+            "Skip the architecture search and train exactly this many "
+            "channels (same robustness check, same export).\n\n"
+            "The export folder is tagged __fixed<N>ch so a comparison model "
+            "is not mistaken for a searched one.")
+        self.fixed_check.setStyleSheet(self.timing_check.styleSheet())
+        self.fixed_check.toggled.connect(self._fixed_toggled)
+        lay.addLayout(self._field(self.fixed_check, self.fixed_edit))
+        self.fixed_edit.setEnabled(False)
+
         self.setup_btn = QPushButton("Model and memory…")
         self.setup_btn.setCursor(Qt.PointingHandCursor)
         self.setup_btn.setFixedHeight(32)
@@ -3763,6 +3947,26 @@ class EdgeAiGui(QMainWindow):
         else:
             self.fe_edit.setFocus()
 
+    def _fixed_toggled(self, on):
+        """Like the timing option: the field opens empty when ticked, and
+        unticking drops the number rather than leaving it greyed out."""
+        self.fixed_edit.setEnabled(on)
+        if on:
+            self.fixed_edit.setFocus()
+        else:
+            self.fixed_edit.clear()
+        self.refresh()
+
+    def fixed_channels(self):
+        """The hand-picked width, or None when the search should decide."""
+        if not getattr(self, "fixed_check", None) or not self.fixed_check.isChecked():
+            return None
+        try:
+            ch = int(self.fixed_edit.text())
+        except ValueError:
+            return None
+        return ch if ch > 0 else None
+
     def _fe_time_typed(self):
         """The toolbar's feature-extraction time. Empty means 'fall back to
         the estimator'; anything else is the user's own measurement and wins
@@ -3833,17 +4037,34 @@ class EdgeAiGui(QMainWindow):
         """The diagram is the CLA plan. Stage ids 0..n-1 are the fused
         conv+pool stages and DENSE_ID is the FC stage; `to_cla` is the
         domain the user picked, not a flip, so re-picking the current domain
-        is a no-op rather than a surprise."""
+        is a no-op rather than a surprise.
+
+        Only plans in which the CLA stages are the END of the chain are
+        allowed (see is_tail_plan): any other split puts a stage on the
+        slower core and buys no overlap. So a stage never moves alone when
+        that would break the rule -- the stages that have to follow it are
+        moved with it, and the log says which."""
+        n = len(self.cla_plan["stages"])
         if sid == self.DENSE_ID:
-            if self.cla_plan["dense"] == to_cla:
-                return
-            self.cla_plan["dense"] = to_cla
-        elif 0 <= sid < len(self.cla_plan["stages"]):
-            if self.cla_plan["stages"][sid] == to_cla:
-                return
-            self.cla_plan["stages"][sid] = to_cla
+            index = n
+        elif 0 <= sid < n:
+            index = sid
         else:
             return
+        flags = list(self.cla_plan["stages"]) + [self.cla_plan["dense"]]
+        if flags[index] == bool(to_cla):
+            return
+        flags, moved = assign_keeping_tail(flags, index, to_cla)
+        self.cla_plan["stages"] = flags[:n]
+        self.cla_plan["dense"] = flags[n]
+        if moved:
+            names = ", ".join("S%d" % (i + 1) for i in moved)
+            where = "CLA" if to_cla else "C28x"
+            self.log(
+                f"<span style='color:{C_WARN};'>{names} moved to the {where} "
+                f"as well: the CLA stages have to be the end of the chain. "
+                f"A C28x stage after a CLA stage would wait for the CLA, so "
+                f"that split overlaps nothing.</span>")
         self.refresh()
 
     # ------------------------------------------------------------- memory
@@ -3866,6 +4087,11 @@ class EdgeAiGui(QMainWindow):
         return {"stages": list(self.cla_plan["stages"]),
                 "dense": self.cla_plan["dense"]}
 
+    @staticmethod
+    def any_on_cla(cla_stage, layers):
+        """True when at least one stage of this plan runs on the CLA."""
+        return bool(cla_stage["dense"]) or any(cla_stage["stages"][:layers])
+
     def calculate_metrics(self, ch, layers, arena, mode, ih, iw, ncls, pool_w,
                           cla_stage, feature_ram=0):
         """Models the real firmware's memory, not a generic one:
@@ -3880,13 +4106,13 @@ class EdgeAiGui(QMainWindow):
           weights.h/main.c), so moving a stage to the CPU frees CLA RAM.
         * workspace[] and fResult[] need to be CLA-visible as soon as ANY
           stage runs there.
-        * `feature_ram` is the MFCC front end's own working set (the raw
-          slice, the log-mel frames, the FFT scratch). It is not part of the
-          model, but it is the largest thing on the C28x side -- 85 KB,
-          measured as 0xa6c0 words in RAMGS_TOTAL_CNN, against the 164 KB one
-          C28x reaches on this part (the device holds 204 KB in total) --
-          and leaving it out is what made the CPU RAM gauge read zero in
-          every configuration. It is charged to the CPU because the C28x is
+        * `feature_ram` is the MFCC front end's own working set (the
+          log-mel frames, the FFT buffer and its tables). It is not part of
+          the model, but it is still the largest thing on the C28x side --
+          16 KB, 8389 words of mfcc_extract.obj in the .map, against the
+          164 KB one C28x reaches on this part (the device holds 204 KB in
+          total) -- and leaving it out is what made the CPU RAM gauge read
+          zero in every configuration. It is charged to the CPU because the C28x is
           what runs mfcc_extract().
         """
         ds = self.dtype_size(mode)
@@ -3922,13 +4148,22 @@ class EdgeAiGui(QMainWindow):
             # FC weights AND fc_bias: the CLA cannot read flash, so a CLA
             # dense stage needs both copied into CLA RAM (weights.h pragma)
             cla_ram += fc_w_bytes + ncls * ds
-        # Buffers (input_image, workspace, fResult) live in CLA data RAM in
-        # EVERY configuration, even all-CPU. Measured with the real TI build of
+        # Buffers (input_image, workspace, fResult) live in CLA data RAM as
+        # soon as ANY stage runs there. Measured with the real TI build of
         # all 8 combinations: the C28x RAM region is already ~95% full of MFCC
         # buffers, so moving workspace there fails to link (.ebss #10099),
         # while CLA data RAM never gets tight. Only weights are placement-
         # dependent (a CPU stage leaves them in flash -> no RAM at all).
-        cla_ram += input_bytes + workspace_bytes + out_bytes
+        #
+        # With EVERY stage on the C28x the model is judged on CPU RAM and
+        # flash alone: the buffers are charged to the CPU and the CLA budget
+        # stops mattering, so editing it cannot move an all-CPU ceiling. The
+        # LS pool is still treated as the CLA's -- it is not added to the CPU.
+        buffers = input_bytes + workspace_bytes + out_bytes
+        if self.any_on_cla(cla_stage, layers):
+            cla_ram += buffers
+        else:
+            cpu_ram += buffers
 
         return flash, cpu_ram, cla_ram, fc_in
 
@@ -4021,8 +4256,8 @@ class EdgeAiGui(QMainWindow):
             self.canvas.clear(
                 f"{self.canvas.device} cannot hold the feature front end\n\n"
                 f"The feature front end's buffers alone are "
-                f"{self.feature_ram / 1024:.0f} KB (raw slice + log-mel frames "
-                f"+ FFT scratch) against a {c['cpu_kb']:.0f} KB CPU RAM "
+                f"{self.feature_ram / 1024:.0f} KB (log-mel frames + FFT "
+                f"buffer and tables) against a {c['cpu_kb']:.0f} KB CPU RAM "
                 f"budget.\nPick a larger part, shorten the window, or raise "
                 f"the budget in Setup.")
             self._set_status("no room for MFCC", C_ERR)
@@ -4055,7 +4290,11 @@ class EdgeAiGui(QMainWindow):
                     self.max_ch_time = cand
                     break
 
-        self.draw_device(self.max_ch, "ceiling")
+        # A fixed width is what will be trained, so that is what the device
+        # shows -- footprint, gauges and all -- with the ceiling in the note.
+        fx = self.fixed_channels()
+        self.draw_device(fx or self.max_ch, "fixed" if fx else "ceiling")
+        self.train_btn.setText(f"TRAIN {fx} CHANNELS" if fx else "START SEARCH")
         self.train_btn.setEnabled(True)
         if self.status_pill.text().lower() != "training":
             self._set_status("ready", C_OK)
@@ -4096,8 +4335,12 @@ class EdgeAiGui(QMainWindow):
                # added: calculate_metrics charges it to CLA data RAM,
                # because that is where weights.h's DATA_SECTION puts it, and
                # counting it here as well would have this block's total and
-               # the CLA gauge both claim the same 1.5 KB.
-               "ram_kb": self.feature_ram / 1024,
+               # the CLA gauge both claim the same 1.5 KB. With everything
+               # on the C28x it is charged to the CPU, so then it is here.
+               "ram_kb": (self.feature_ram
+                          + (0 if self.any_on_cla(self.cla_stage,
+                                                  self.layers_val)
+                             else self.input_h * self.input_w * ds)) / 1024,
                "ms": self.timing["fe_ms"] if self.timing else None,
                "ms_note": "measured",
                "id": -1, "fixed_note": "always on the C28x"}, False)
@@ -4143,8 +4386,13 @@ class EdgeAiGui(QMainWindow):
 
         cpu_ram_kb, cpu_flash_kb = totals(cpu)
         cla_ram_kb, cla_flash_kb = totals(cla)
-        which = ("largest model that fits in memory" if mode == "ceiling"
-                 else "trained model")
+        if mode == "ceiling":
+            which = "largest model that fits in memory"
+        elif mode == "fixed":
+            which = (f"fixed for comparison · ceiling {self.max_ch}"
+                     + (" · DOES NOT FIT" if ch > self.max_ch else ""))
+        else:
+            which = "trained model"
         limit = getattr(self, "max_ch_time", None)
         if mode == "ceiling" and limit is not None and limit < ch:
             which += f" · the frame budget allows {limit}"
@@ -4374,6 +4622,8 @@ class EdgeAiGui(QMainWindow):
              + ("MaxPool(2,2), time + coefficient" if self.pool_w
                 else "MaxPool(2,1), time only")),
             ("Channel search",
+             f"fixed at {s['channels']} by hand, no search  (ceiling "
+             f"{self.max_ch})" if s.get("fixed") else
              f"ceiling {self.max_ch}  →  selected {s['channels']}"),
             ("Target", f"{s['metric']} ≥ {s['target']:.0f}%"),
             ("Robustness check",
@@ -4592,6 +4842,12 @@ class EdgeAiGui(QMainWindow):
         except ValueError:
             self.log(f"<span style='color:{C_ERR};'>Target value must be numeric.</span>")
             return
+        fixed = self.fixed_channels()
+        if self.fixed_check.isChecked() and fixed is None:
+            self.log(f"<span style='color:{C_ERR};'>Fixed channels is on but "
+                     f"the channel count is empty -- type a number, or turn "
+                     f"the option off to search.</span>")
+            return
 
         port = self.target_mismatch()
         if port:
@@ -4630,7 +4886,7 @@ class EdgeAiGui(QMainWindow):
             self.max_ch, self.layers_val, self.quant_mode, self.input_h,
             self.input_w, self.classes_val, target,
             self.metric_combo.currentText(), self.pool_w, self.dataset_path,
-            self.get_cla_stage(), self._timing_note())
+            self.get_cla_stage(), self._timing_note(), fixed_channels=fixed)
         self.thread.update_signal.connect(self.log)
         self.thread.progress_signal.connect(self.on_progress)
         self.thread.summary_signal.connect(self.on_summary)
@@ -4655,7 +4911,7 @@ class EdgeAiGui(QMainWindow):
             f"MAC basi {t['mac_cost']['cla']:.0f} cevrim (CLA) / "
             f"{t['mac_cost']['cpu']:.0f} (C28x)"
             + f" -- model, fit disi tutulan olcumlerde "
-              f"%{VALIDATION_BAND[0]:+.0f} .. %{VALIDATION_BAND[1]:+.0f} "
+              f"%{VALIDATION_BAND[0]:+.1f} .. %{VALIDATION_BAND[1]:+.1f} "
               f"sapiyor (-O0 derleme)"
             + (" -- olculen inference suresinden" if t["infer_measured"]
                else " -- model varsayimi"),
@@ -4685,9 +4941,11 @@ class EdgeAiGui(QMainWindow):
         or the diagram change would only make the screen lie about the run."""
         self.canvas.locked = locked
         for w in (self.dataset_btn, self.quant_combo, self.metric_combo,
-                  self.target_edit, self.timing_check, self.setup_btn):
+                  self.target_edit, self.timing_check, self.setup_btn,
+                  self.fixed_check):
             w.setEnabled(not locked)
         self.fe_edit.setEnabled(not locked and self.timing_check.isChecked())
+        self.fixed_edit.setEnabled(not locked and self.fixed_check.isChecked())
         self.canvas.hint = self._current_hint()
         self.canvas.update()
 

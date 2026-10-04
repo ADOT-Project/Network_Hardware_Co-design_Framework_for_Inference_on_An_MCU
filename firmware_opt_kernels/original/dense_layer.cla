@@ -1,0 +1,214 @@
+#include <cla_dense_layer_shared.h>
+#include "F2837xD_device.h"
+#include "definitions.h"
+#include "cla_pipeline_config.h"
+
+// GUNCELLEME (asama bazli bolusum): asagidaki her asama, yalnizca
+// cla_pipeline_config.h'ta 1 isaretlendiyse derlenir. CPU'ya alinan asamanin
+// CLA kodu HIC uretilmez -- bu sadece bir tercih degil, ZORUNLULUK: CLA
+// program RAM'i (RAMLS5_PROG) 2048 byte ve uc asama birlikte 2042 byte
+// tutuyor (bkz. cla_pipeline_config.h'taki bellek notu). Ayni sebeple, uc
+// asama da CLA'daysa hepsi TEK gorevde toplanir (CLA_SINGLE_TASK); ayri
+// gorev girisleri icin yer yok. Biri CPU'ya alininca acilan yerle asama
+// basina ayri gorev kullanilabilir.
+//
+// CPU ikizleri: convolution.c::conv1_pool_fused_cpu / conv2_pool_fused_cpu /
+// dense_fc_cpu -- matematik birebir ayni.
+
+//
+// Fused Aşama 1: conv1 + relu + pool1 (tek geçiş, ara conv çıktısı tutulmaz)
+//
+#if CLA_STAGE_CONV1_POOL1
+#pragma CODE_SECTION(conv1_pool_fused_cla, "Cla1Prog")
+void conv1_pool_fused_cla(const int16_t* input, int16_t* pooled_out,
+                           const int16_t* filters, const int16_t* bias)
+{
+    uint16_t f, pr, c, fi, fj, sub;
+    for (f = 0; f < NUM_FILTERS; f++) {
+        uint32_t filter_offset = f * (FILTER_SIZE * FILTER_SIZE);
+        uint32_t out_offset = f * (POOL1_OUT_H * POOL1_OUT_W);
+
+        for (pr = 0; pr < POOL1_OUT_H; pr++) {
+            for (c = 0; c < CONV1_OUT_W; c++) {
+                int16_t best = -32768;
+
+                for (sub = 0; sub < 2; sub++) {
+                    uint16_t r = pr * 2 + sub;
+                    float sum = 0.0f;
+                    for (fi = 0; fi < FILTER_SIZE; fi++) {
+                        uint32_t row_ptr = (r + fi) * IMAGE_W;
+                        for (fj = 0; fj < FILTER_SIZE; fj++) {
+                            sum += (float)input[row_ptr + (c + fj)] *
+                                   (float)filters[filter_offset + fi*FILTER_SIZE + fj];
+                        }
+                    }
+                    // GUNCELLEME: bias kendi CONV1_BIAS_SCALE'i ile kuantalanmis
+                    // (agirliktan farkli); sum'a (CONV1_WEIGHT_SCALE uzayinda)
+                    // eklemeden once (weight_scale/bias_scale) ile oraya
+                    // tasiniyor. Eskiden dogrudan toplaniyordu -- BLDC
+                    // modelinde bu iki olcek arasinda ~%3 fark var (MNIST'te
+                    // fark edilmeyecek kadar kucuktu).
+                    // DUZELTME (bias * INPUT_SCALE): main.c girisi INPUT_SCALE (256) ile
+                    // carpip int16'ya ceviriyor, dolayisiyla TUM aktivasyonlar ag
+                    // boyunca x256 biriminde tasiniyor. Bias da ayni birime
+                    // tasinmazsa cihaz egitilen agi degil, bias'lari ~256 kat
+                    // zayiflatilmis FARKLI bir agi hesapliyor. Olculen (72 ornekli
+                    // held-out set): duzeltmeden once float modelle karar uyumu
+                    // %97.2, logitler ~220x float (%23 sapma); sonra %100, ~255x
+                    // (%0.19 sapma). Sabit, derleme zamaninda katlansin diye
+                    // parantezli -- CLA program RAM'inde (2042/2048) ek komut yok.
+                    sum += (float)bias[f] * ((CONV1_WEIGHT_SCALE / CONV1_BIAS_SCALE) * INPUT_SCALE);
+                    if (sum < 0.0f) sum = 0.0f;
+                    int16_t val = (int16_t)(sum / CONV1_WEIGHT_SCALE);
+                    if (val > best) best = val;
+                }
+                pooled_out[out_offset + pr*CONV1_OUT_W + c] = best;
+            }
+        }
+    }
+}
+#endif // CLA_STAGE_CONV1_POOL1
+
+//
+// Fused Aşama 2: conv2 + relu + pool2 (tek geçiş)
+//
+#if CLA_STAGE_CONV2_POOL2
+#pragma CODE_SECTION(conv2_pool_fused_cla, "Cla1Prog")
+void conv2_pool_fused_cla(const int16_t* input, int16_t* pooled_out,
+                           const int16_t* filters, const int16_t* bias)
+{
+    uint16_t out_f, in_c, pr, c, fi, fj, sub;
+
+    for (out_f = 0; out_f < NUM_FILTERS; out_f++) {
+        uint32_t out_offset = out_f * (POOL2_OUT_H * POOL2_OUT_W);
+
+        for (pr = 0; pr < POOL2_OUT_H; pr++) {
+            for (c = 0; c < CONV2_OUT_W; c++) {
+                int16_t best = -32768;
+
+                for (sub = 0; sub < 2; sub++) {
+                    uint16_t r = pr * 2 + sub;
+                    float sum = 0.0f;
+
+                    for (in_c = 0; in_c < NUM_FILTERS; in_c++) {
+                        uint32_t in_offset = (uint32_t)in_c * (POOL1_OUT_H * POOL1_OUT_W);
+                        uint32_t filter_offset = (out_f * NUM_FILTERS * 9) + (in_c * 9);
+
+                        for (fi = 0; fi < 3; fi++) {
+                            uint32_t row_ptr = in_offset + (r + fi) * POOL1_OUT_W;
+                            for (fj = 0; fj < 3; fj++) {
+                                sum += (float)input[row_ptr + (c + fj)] *
+                                       (float)filters[filter_offset + fi*3 + fj];
+                            }
+                        }
+                    }
+                    // GUNCELLEME: bkz. conv1_pool_fused_cla -- bias kendi
+                    // olcegiyle weight_scale uzayina tasiniyor.
+                    sum += (float)bias[out_f] * ((CONV2_WEIGHT_SCALE / CONV2_BIAS_SCALE) * INPUT_SCALE);
+                    if (sum < 0.0f) sum = 0.0f;
+                    int16_t val = (int16_t)(sum / CONV2_WEIGHT_SCALE);
+                    if (val > best) best = val;
+                }
+                pooled_out[out_offset + pr*CONV2_OUT_W + c] = best;
+            }
+        }
+    }
+}
+#endif // CLA_STAGE_CONV2_POOL2
+
+
+#if CLA_SINGLE_TASK
+//
+// --- Uc asama da CLA'da: hepsi TEK gorevde ------------------------------
+// Task 1: conv1_pool_fused -> conv2_pool_fused -> dense
+//
+// Bu, program RAM'ine sigan tek duzen (bkz. dosya basindaki not): ayri
+// gorev girisleri icin 6 byte bosluk yeterli degil. Ayrica CPU'nun CLA'yi
+// beklemesi gerekmez -- tek tetikle tum inference biter, CPU bu sirada bir
+// sonraki pencerenin MFCC'sini hesaplayabilir.
+//
+#pragma CODE_SECTION(Cla1Task1, "Cla1Prog")
+__interrupt void Cla1Task1(void)
+{
+    GpioDataRegs.GPCCLEAR.bit.GPIO67 = 1;
+
+    // workspace[0 .. POOL1_SIZE-1]                = pool1 çıktısı
+    conv1_pool_fused_cla(input_image, workspace, conv1_weights, conv1_bias);
+
+    // workspace[POOL1_SIZE .. POOL1_SIZE+POOL2_SIZE-1] = pool2 çıktısı (=dense girdisi)
+    conv2_pool_fused_cla(workspace, &workspace[POOL1_SIZE], conv2_weights, conv2_bias);
+
+    // GUNCELLEME (GERI ALINDI): FC katmani CPU'ya tasinmisti (weight[]
+    // CLA'nin dar belleğine sigmiyordu), ama bu tum inference'i CLA'da tek
+    // seferde tetikleyip CPU'yu bir sonraki veriyi hazirlamakta serbest
+    // birakan mimariyi bozuyordu (CPU, CLA'nin sonucunu beklemek zorunda
+    // kalirdi). Asil sorun weight[]'in buyuklugu degil, MAX_ELEMENTS'in
+    // (workspace boyutu) eski, fused-olmayan bir tasarimdan kalma yanlis
+    // formulle ~9000 byte israf etmesiydi (bkz. definitions.h). O
+    // duzeltilince FC buraya, CLA'ya geri alindi -- tum inference yine tek
+    // CLA gorevinde, CPU-CLA senkronizasyonu gerekmiyor.
+    unsigned int i, k;
+    for (k = 0; k < NUM_CLASSES; k++) {
+        float sum = 0.0f;
+        for (i = 0; i < DENSE_LAYER_INPUT; i++) {
+            sum += (float)workspace[POOL1_SIZE + i] * (float)weight[i + k*DENSE_LAYER_INPUT];
+        }
+        // fc_bias kendi FC_BIAS_SCALE'iyle kuantalanmis oldugu icin, W*X
+        // toplami FC_WEIGHT_SCALE'e bolundukten SONRA, gercek (float)
+        // deger uzayinda toplaniyor (bkz. conv1/conv2'deki bias-olcek notu).
+        fResult[k] = sum / FC_WEIGHT_SCALE + (float)fc_bias[k] * (INPUT_SCALE / FC_BIAS_SCALE);
+    }
+
+    GpioDataRegs.GPCSET.bit.GPIO67 = 1;
+}
+
+#else   // !CLA_SINGLE_TASK
+//
+// --- Karma dagilim: asama basina ayri gorev ----------------------------
+// Task1 = S1 (conv1+pool1), Task2 = S2 (conv2+pool2), Task3 = S3 (dense).
+// Numaralar asamaya SABIT baglidir (secilmeyen asamanin gorevi hic
+// derlenmez), boylece S1=CLA, S2=CPU, S3=CLA gibi bitisik olmayan
+// dagilimlar da calisir. main.c her asamayi ya CPU fonksiyonuyla ya da
+// Cla1ForceTaskNandWait() ile sirayla yurutur.
+//
+// GPIO67 isareti (CLA mesgul) sadece ilk ve son CLA asamasinda anlamli
+// oldugundan burada her gorevde ayri ayri kullanilmiyor.
+//
+#if CLA_STAGE_CONV1_POOL1
+#pragma CODE_SECTION(Cla1Task1, "Cla1Prog")
+__interrupt void Cla1Task1(void)
+{
+    conv1_pool_fused_cla(input_image, workspace, conv1_weights, conv1_bias);
+}
+#endif
+
+#if CLA_STAGE_CONV2_POOL2
+#pragma CODE_SECTION(Cla1Task2, "Cla1Prog")
+__interrupt void Cla1Task2(void)
+{
+    conv2_pool_fused_cla(workspace, &workspace[POOL1_SIZE], conv2_weights, conv2_bias);
+}
+#endif
+
+#if CLA_STAGE_DENSE
+#pragma CODE_SECTION(Cla1Task3, "Cla1Prog")
+__interrupt void Cla1Task3(void)
+{
+    unsigned int i, k;
+    for (k = 0; k < NUM_CLASSES; k++) {
+        float sum = 0.0f;
+        for (i = 0; i < DENSE_LAYER_INPUT; i++) {
+            sum += (float)workspace[POOL1_SIZE + i] * (float)weight[i + k*DENSE_LAYER_INPUT];
+        }
+        fResult[k] = sum / FC_WEIGHT_SCALE + (float)fc_bias[k] * (INPUT_SCALE / FC_BIAS_SCALE);
+    }
+}
+#endif
+
+#endif  // CLA_SINGLE_TASK
+
+// GUNCELLEME: Cla1Task2..8 (bos govdeli, 7*8=56 byte) KALDIRILDI. Hicbiri
+// kullanilmiyordu ve bu, Cla1Prog'daki 50 byte'lik taskmayi cozmek icin
+// gereken kadar (56 byte) yer aciyordu -- FC'yi CLA'da tutabilmemizi
+// sagliyor. Yukaridaki karma-dagilim gorevleri de ayni sebeple KOSULLU:
+// yalnizca secilen asamanin gorevi derlenir, bos gorev birakilmaz.
