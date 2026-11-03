@@ -86,6 +86,15 @@ from PyQt5.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog,
                              QSizePolicy, QStackedWidget, QTextEdit,
                              QVBoxLayout, QWidget)
 
+# Dataset preparation (recordings in class folders -> dataset.npz) lives in its
+# own file so that it runs without this window, from a terminal or a test.
+try:
+    import adot_dataset
+    ADOT_DATASET_ERROR = ""
+except Exception as _e:                      # reported when the button is used
+    adot_dataset = None
+    ADOT_DATASET_ERROR = f"{type(_e).__name__}: {_e}"
+
 # ==========================================
 # 0z. INSTALL LAYOUT
 # ==========================================
@@ -405,167 +414,84 @@ def device_spec_line(dev):
 # that actually takes the frame?
 #
 # The costs below are for the kernels this firmware really runs, not for a
-# datasheet peak. Both halves are ANCHORED to measurements taken on the
-# board (2026-09-26, 200 MHz F28379D, the Debug build in this repository):
+# datasheet peak, and every one of them is SOLVED from a time measured on the
+# board (2026-10-04, 200 MHz F28379D, -O0 build, 65x12 input, 2 classes,
+# GPIO-timed, MIMII fan 6 dB models):
 #
-#   inference  6 channels, 65x12 input, S1+S2+S3 in one CLA task, the
-#              GPIO67 toggle in Cla1Task1 -> 73 ms. 14.6 M cycles for
-#              108,072 MACs, i.e. 135 effective cycles a MAC.
-#   MFCC       one pass of mfcc_extract(), 65 frames, 512-point FFT,
-#              40 mel bands -> 202 ms. 40.4 M cycles for 2.74 M modelled
-#              float operations: 14.6 cycles each, which is CYC_FLOP.
+#   channels   feature extraction   inference, all C28x   inference, all CLA
+#       4          32.25 ms              2.760 ms              3.061 ms
+#       9          32.25 ms              9.089 ms             10.565 ms
+#      12          32.25 ms             14.532 ms             17.026 ms
 #
-# They were measured on different cores through different code, and each
-# asks the hand count for almost the same correction: 4.48 on the CLA, 4.88
-# on the C28x. One unoptimised build, one factor -- which is why CPU_TUNE is
-# allowed to borrow the CLA's. Hand-counting both kernels off the same
-# primitive table then puts a conv MAC at ~73 effective cycles on the C28x
-# against the CLA's measured 135: the CLA is about 1.8x the more expensive
-# place to run this kernel.
+# These are the pointer-walking kernels: fused_kernels_opt.h (3x3 window
+# written out, operands read through walking pointers, one source for both
+# cores) and the radix-4 real-input mfcc_extract.c. The indexed kernels
+# they replaced measured 70 ms (C28x) and 140 ms (CLA) at 9 channels, and
+# 203 ms for the MFCC -- same compiler, same -O0, same arithmetic. What
+# changed is the code around the multiply-add, and that is the finding worth
+# keeping: the CLA's old 2x handicap was index arithmetic and three-trip
+# loops, not the core. With those gone it runs the same network 11% to 17%
+# slower than the C28x.
 #
-# That is the opposite of what a datasheet suggests (same clock, same float
-# width) and it is not a paradox: this kernel is index arithmetic and int16
-# conversions wrapped around a multiply-add, and the C28x brings a 32-bit
-# integer ALU, RPTB hardware loops and richer addressing to exactly that,
-# where the CLA has a narrow integer side, no hardware loop and three delay
-# slots on every branch. So on this build the CLA does not make a stage
-# faster -- it makes it CONCURRENT, which is a different and often better
-# thing, and it is what the frame budget is there to show.
+# The conv model is two prices per core -- a MAC, and a completed
+# accumulation ("window": reset, bias, ReLU/pool compare, and its share of
+# the descale and store) -- because those are the only two things the
+# kernels do a number of times that scales differently with the channel
+# count. Both are solved from the 4- and 12-channel measurements; the
+# 9-channel one is held out and is the accuracy claim.
 #
-# CAVEAT, and it is a big one: both anchors are from the DEBUG build --
-# unoptimised code, nothing unrolled, CLA program RAM at 2042 of 2048 words.
-# They describe this firmware as it is today, not the silicon's ceiling. A
-# release build with unrolled taps and pointer walks instead of recomputed
-# uint32 indices would move every number here, so re-measure before quoting
-# any of it.
+# What three measurements can NOT separate, and the model therefore assumes:
+#   * a MAC costs the same in conv1, conv2 and the dense layer. conv2 wraps
+#     nine MACs in an in_c iteration that conv1 does not have; that tail is
+#     folded into the per-MAC price. Stage-by-stage times are the model's
+#     split of a measured TOTAL -- only the totals were measured.
+#   * one input size (65x12), one class count. A different window changes
+#     the ratio of MACs to accumulations, which is exactly what the two
+#     prices are for, but it has not been checked on the board.
+#   * -O0. An optimised build changes both prices and may stop them being
+#     constants at all; it needs its own measurements.
 #
-# 135 cycles for a multiply and an add wants explaining. The multiply and
-# the add are not the cost; everything around them is:
-#
-#   * the operands are int16 and the accumulator is float, so every MAC is
-#     two loads and two MI16TOF32 conversions before the MMPYF32/MADDF32
-#     (dense_layer.cla and convolution.c both do
-#     `sum += (float)input[..] * (float)filters[..]`);
-#   * the indices are uint32 expressions recomputed per iteration
-#     (`row_ptr + (c + fj)`, `filter_offset + fi*FILTER_SIZE + fj`), and the
-#     CLA is a float machine -- its integer side is narrow, so address
-#     arithmetic costs real instructions there;
-#   * there is no hardware loop on the CLA and MBCNDD carries three delay
-#     slots, so a three-iteration inner loop pays a branch tail per MAC;
-#   * and CLA program RAM is at 2042 of 2048 words, which means this is a
-#     build optimised for SIZE -- nothing is unrolled.
-#
-# The same three things are why a stage is priced per ACCUMULATION as well
-# as per MAC: each `sum` ends with a bias multiply-add, a ReLU compare, an
-# int16 conversion, a pool compare and -- the expensive one -- a float
-# DIVISION by the quantization scale, which neither core has an instruction
-# for (`sum / CONV1_WEIGHT_SCALE`, and `sum / FC_WEIGHT_SCALE` per class in
-# the dense stage).
-#
-# One effect pulls the other way and is folded into the C28x's price
-# already: a CPU stage reads its weights from flash with wait states, where
-# a CLA stage reads LS RAM in a single cycle. It is not enough to close a
-# 2.5x gap. Both prices stay editable, and typing a measured inference time
-# re-anchors them from the GUI without touching this file.
-# The two measurements, as DATA. Everything priced per MAC or per float
-# operation below is solved from these, so correcting one of them is a
-# one-line change and never a hunt for a magic number.
-#
-# The inference anchor is the build in CNN_Inference_Edge-AI_with_CLA: its
-# Cla1Task1 toggles GPIO67 around conv1+conv2+dense, which is what a scope
-# sees. Its channel count is not a guess -- the .map pins it down, since
-# NUM_FILTERS is baked into every weight array's size:
-#     _conv2_weights - _conv1_weights = 0x906d - 0x9037 =  54 words = 9*1*F
-#     _weight        - _conv2_weights = 0x91b1 - 0x906d = 324 words = 9*F*F
-#     _fc_bias       - _workspace     = 0x9028 - 0x8640 = 2536 words
-#                                     = F*POOL1 + F*POOL2
-# all three give F = 6, and that .map was built the same day as the .cla
-# file it describes.
-CLA_ANCHOR = {"channels": 6, "input_h": 65, "input_w": 12, "classes": 3,
-              "layers": 2, "pool_w": False, "mhz": 200.0, "ms": 73.0,
-              "tasks": 1}
-# Held out of the fit on purpose: the same firmware rebuilt and measured the
-# same way, once smaller than the anchor and once larger. Nothing is solved
-# from either -- they are the only numbers here free to disagree, which is
-# what makes them worth quoting.
-#
-# They also show the model's one systematic weakness. The correction each
-# measurement asks of the hand count is not constant, it climbs with the
-# channel count: 3.96 at 4 channels, 4.48 at 6, 4.68 at 11. The single fitted
-# factor sits in the middle, so the model runs slow for small networks and
-# fast for large ones -- +13% and -4% at the two ends of a 4-to-11 channel,
-# 34-to-213 ms range. Worth knowing before quoting a figure far outside it,
-# and worth fixing in the primitive table rather than by re-fitting, if
-# anyone ever has the measurements to do it properly.
-CLA_VALIDATIONS = [
-    {"channels": 4, "input_h": 65, "input_w": 12, "classes": 3, "layers": 2,
-     "pool_w": False, "mhz": 200.0, "ms": 34.0, "tasks": 1,
-     "note": "BLDC, 3 classes, 2026-09-27"},
-    {"channels": 11, "input_h": 65, "input_w": 12, "classes": 2, "layers": 2,
-     "pool_w": False, "mhz": 200.0, "ms": 213.0, "tasks": 1,
-     "note": "MIMII fan 6 dB, 2 classes, 2026-09-28"},
+# One thing that is NOT symmetric between the cores and is inside these
+# numbers: C28x code runs from flash (3 wait states at 200 MHz, prefetch
+# on), CLA code runs from RAM. Moving the MFCC to RAM made it 9% faster
+# (35 -> 32 ms); the C28x inference figures above are from flash.
+KERNEL_SETUP = {"input_h": 65, "input_w": 12, "classes": 2, "layers": 2,
+                "pool_w": False, "mhz": 200.0,
+                "note": "MIMII fan 6 dB, 2 classes, 2026-10-04"}
+# "fit": True  -> the two prices are solved from it
+# "fit": False -> held out; nothing is solved from it, so it is the only
+#                 row here free to disagree with the model
+KERNEL_MEASUREMENTS = [
+    {"channels": 4,  "cpu_ms": 2.7595,  "cla_ms": 3.0605,  "fit": True},
+    {"channels": 9,  "cpu_ms": 9.0890,  "cla_ms": 10.5645, "fit": False},
+    {"channels": 12, "cpu_ms": 14.5315, "cla_ms": 17.0260, "fit": True},
 ]
 MFCC_ANCHOR = {"input_h": 65, "input_w": 12, "sr": 16000, "n_fft": 512,
-               "hop": 256, "n_mels": 40, "mhz": 200.0, "ms": 202.0,
+               "hop": 256, "n_mels": 40, "mhz": 200.0, "ms": 32.25,
                # not the 2*bins approximation the fallback uses: this is
                # FEAT_MEL_NNZ out of the firmware's own feature_tables.h
                "mel_nnz": 490}
-# What the 200 ms window contains, since an anchor is only as good as the
-# thing it was measured around. main.c toggles GPIO18 over exactly two
-# statements: mfcc_extract(), and the 65x12 loop that scales its output by
-# INPUT_SCALE, clamps it and stores it as int16. That second loop is 0.06%
-# of the work, so the figure is mfcc_extract() and the model is right to
-# treat it as such.
+# What the 32.25 ms contains, since an anchor is only as good as the thing
+# it was measured around. main.c toggles GPIO18 over exactly two statements:
+# mfcc_extract(), and the 65x12 loop that scales its output by INPUT_SCALE,
+# clamps it and stores it as int16. It was measured on the second window
+# onwards -- the first call also builds the twiddle tables.
 #
-# Two things it is NOT, both of which would make it an over-estimate if you
-# ever compare against a live system:
-#   * the input is golden_inputs[], a const array in FLASH, and the
-#     function reads it twice -- 33,792 16-bit flash reads. With the
-#     prefetch buffer that is ~0.1% of the total, so it does not matter
-#     here, but an ADC buffer in RAM would be no slower.
-#   * there is no waiting for audio in it. The 1056 ms the window spans in
-#     real time is not part of this number, and must not be added to it:
-#     acquisition overlaps everything else.
-# Which channel count the inference figure belongs to took two rounds to
-# settle, and the wrong answer was argued for first. The committed
-# Debug/dense_layer_cla.map is a 6-channel build -- conv1_weights 54 words =
-# 9*1*F, conv2_weights 324 = 9*F*F, workspace 2536 = F*(31*10+14*8), and
-# definitions.h agrees -- but a plausibility argument was preferred over it:
-# the hand count below needed 1.8x to reach 70 ms at 10 channels against
-# 4.3x at 6, and 4.3x looked like the instruction counting being wrong.
+# CAUTION: 32.25 ms was measured while mfcc_extract() ran from RAM, through
+# a switch that has since been removed. The firmware now runs it from flash
+# like the rest of the C28x code, where it measured about 35 ms (a rounded
+# reading). Until that is re-measured to the same precision and typed in
+# here, the feature-extraction estimate is about 9% low.
 #
-# Re-measuring the firmware as it stands settled it: 6 channels, 73 ms. The
-# .map was right and the plausibility argument was not. Worth keeping as a
-# note to self -- a static fact about the binary beat a chain of reasoning
-# about what a number ought to be.
-#
-# The reading is now also self-consistent, which the other one was not. The
-# two measurements are on different cores through different code, and the
-# correction each one asks of the hand count comes out at 4.48 (CLA) and
-# 4.88 (C28x) -- one build, one optimisation level, one factor, agreeing to
-# within 9%. At 10 channels those were 1.81 and 4.88.
-
-# --- primitives ---------------------------------------------------------
-# What each core pays for one operation of the kernels in dense_layer.cla
-# and convolution.c, counted by hand from the instruction set. These set the
-# SHAPE of the estimate -- how conv1 compares to conv2, what another channel
-# count costs -- while their absolute level is corrected by the tune factor
-# solved from the measurement further down. Keeping the two apart is the
-# point: the structure comes from the code, the level from the board.
-#
-# The CLA and the C28x differ in exactly three of them, which is the whole
-# story of why the same C is slower on the CLA: integer adds, integer
-# multiplies and the loop tail. The C28x has a 32-bit integer ALU and RPTB
-# hardware loops; the CLA has a narrow integer side and MBCNDD's three delay
-# slots. The float and memory work is identical on both.
-_PRIM_COMMON = {"load": 1.0, "store": 1.0, "i2f": 1.0, "f2i": 2.0,
-                "fmul": 2.0, "fadd": 2.0, "div": 30.0}
-CLA_PRIMITIVES = dict(_PRIM_COMMON, iadd=3.0, imul=8.0, loop=6.0)
-CPU_PRIMITIVES = dict(_PRIM_COMMON, iadd=1.0, imul=2.0, loop=2.0)
+# There is no waiting for audio in it. The 1056 ms the window spans in real
+# time is not part of this number, and must not be added to it: acquisition
+# overlaps everything else.
 
 CYC_MISC = 1.5        # a compare or a store on its own
-CYC_LOG = 75.0        # log10f() from the RTS library
-CYC_SINCOS = 60.0     # one cosf + sinf pair (FFT twiddle seed, once per stage)
+CYC_LOG = 100.0       # power_db() in mfcc_extract.c: one division and a
+                      # short series. An estimate -- only the SAVING against
+                      # the library's log10f() was measured (about 300
+                      # cycles a call).
 CYC_DIV = 24.0        # float division
 CLA_TASK_OVERHEAD = 60.0   # trigger a Cla1TaskN and collect its result
 
@@ -586,7 +512,19 @@ def feature_plan(input_h, input_w, fcfg=None):
     n_fft = int(src.get("n_fft", FEAT_ASSUMED["n_fft"]))
     hop = int(src.get("hop", FEAT_ASSUMED["hop"]))
     n_mels = int(src.get("n_mels", FEAT_ASSUMED["n_mels"]))
+    # "logspec" (feature_config.json of a vibration dataset): the same front
+    # end up to the log, with linear bands in place of the mel filters and no
+    # DCT -- n_mels is then the band count and equals the input width.
+    feature = str(src.get("feature", "mfcc"))
     n_frames, n_out = int(input_h), int(input_w)
+    if feature == "raw":
+        # No transform at all: the window's samples, mean removed and scaled
+        # to their peak, written row by row into the input matrix.
+        slice_len = int(src.get("slice_len", n_frames * n_out))
+        return {"sr": sr, "n_fft": 0, "hop": 0, "n_mels": 0,
+                "n_frames": n_frames, "n_out": n_out, "slice_len": slice_len,
+                "bins": 0, "mel_nnz": 0, "feature": "raw", "dct": False,
+                "window_ms": 1000.0 * slice_len / sr, "assumed": False}
     # center=False, so the window is exactly what the frames span -- the same
     # arithmetic prepare_features.py used (65 frames, hop 256, n_fft 512 ->
     # 16896 samples, which is FEAT_SLICE_LEN in the firmware's header).
@@ -599,46 +537,83 @@ def feature_plan(input_h, input_w, fcfg=None):
     return {"sr": sr, "n_fft": n_fft, "hop": hop, "n_mels": n_mels,
             "n_frames": n_frames, "n_out": n_out, "slice_len": slice_len,
             "bins": bins, "mel_nnz": mel_nnz,
+            "feature": feature, "dct": feature != "logspec",
             "window_ms": 1000.0 * slice_len / sr,
             "assumed": fcfg is None}
 
 
 def mfcc_ops(plan):
     """What one pass of mfcc_extract() has to do, counted, before anything
-    is priced: float operations, the library calls and divisions that are
-    not priced per flop, the FFT's share, and the working set.
+    is priced: float operations, the per-band and per-coefficient work that
+    is not priced per flop, the FFT's share, and the working set.
 
-    Follows that file statement by statement rather than quoting a headline
-    figure -- including the two places it is deliberately naive: the power
-    spectrum is recomputed inside the mel loop (once per non-zero weight,
-    not once per bin), and the FFT is a textbook radix-2 complex transform
-    on a real signal, which the file itself notes is roughly 10x the cost of
-    C2000Ware's RFFT_f32.
+    Follows that file loop by loop:
+
+      pass 1    window + complex packing + bit reversal + the first two FFT
+                stages (twiddles 1 and -j, no multiplies): a subtract and a
+                multiply per sample, then 16 add/subs per group of four
+                complex values.
+      radix-4   M = n_fft/2 complex points, M/4 butterflies a pass, each 12
+                multiplies and 22 add/subs. (log2(M) - 2) // 2 passes, and
+                one radix-2 pass more when M is not a power of 4.
+      unpack    one pair of FFT outputs gives two power bins: 20 flops.
+      mel       a multiply-add per non-zero weight, then one scale per band.
+      dct       a multiply-add per coefficient per band. Not run for a
+                log-spectrum front end (plan["dct"] False): the band values
+                go straight to the z-score.
 
     Split out from mfcc_cost() so the flop price can be SOLVED from the
     measured anchor instead of being typed in."""
+    if plan.get("feature") == "raw":
+        # Two passes over the window: sum for the mean, then subtract and
+        # track the peak; a third subtracts, scales and stores. No tables,
+        # no buffers of its own. An ESTIMATE priced at the MFCC's flop cost:
+        # nothing with this front end has been timed on the board yet.
+        n = plan["slice_len"]
+        return {"flops": 6 * n, "fixed_cycles": 2 * CYC_DIV,
+                "fft_flops": 0, "ram_bytes": 0}
     n_fft, n_mels = plan["n_fft"], plan["n_mels"]
     n_frames, n_out = plan["n_frames"], plan["n_out"]
-    stages = max(1, int(round(np.log2(n_fft))))
-    butterflies = (n_fft // 2) * stages
+    m = n_fft // 2
+    stages2 = max(0, int(round(np.log2(m))) - 2)    # radix-2 stages after pass 1
+    r4_passes, r2_left = stages2 // 2, stages2 % 2
 
     # per frame
-    f_window = 2 * n_fft                    # windowed real part + zeroed imag
-    f_fft = 16 * butterflies                # 6 for the product, 4 for the
-                                            # add/sub pair, 6 for the twiddle
-                                            # recurrence
-    f_mel = 5 * plan["mel_nnz"]             # |X|^2 (3) + weighted accumulate (2)
-    f_dct = 2 * n_out * n_mels
-    flops = n_frames * (f_window + f_fft + f_mel + f_dct)
-    flops += 3 * plan["slice_len"]          # mean, subtract, scale
-    flops += 2 * n_frames * n_mels          # global max pass + floor pass
-    fixed = n_frames * (CYC_SINCOS * stages + CYC_LOG * n_mels
+    f_pass1 = 2 * n_fft + 4 * m
+    f_fft = r4_passes * (m // 4) * 34 + r2_left * (m // 2) * 10
+    f_unpack = 20 * (m // 2)
+    f_mel = 2 * plan["mel_nnz"] + n_mels
+    f_dct = (2 * n_out * n_mels + n_out) if plan.get("dct", True) else 0
+    flops = n_frames * (f_pass1 + f_fft + f_unpack + f_mel + f_dct)
+    flops += plan["slice_len"]              # the integer sum for the mean
+    flops += 2 * n_frames * n_mels          # running max + the floor pass
+    fixed = n_frames * (CYC_LOG * n_mels
                         + n_out * (CYC_DIV + 2 * CYC_MISC))
-    # Working set: x[slice_len], log_mel[n_frames][n_mels], fft_re/im[n_fft],
-    # all float (4 storage bytes each on this target).
-    ram = 4 * (plan["slice_len"] + n_frames * n_mels + 2 * n_fft)
+    # Working set: log_mel[n_frames][n_mels], the FFT buffer z[n_fft + 2] and
+    # the two twiddle tables tw[n_fft], tw4[n_fft] -- all float, 4 storage
+    # bytes each on this target -- plus rev4[n_fft/8] at 2. The float copy
+    # of the whole slice that the indexed version kept (x[slice_len], 66 KB
+    # at 65 frames) is gone.
+    ram = 4 * (n_frames * n_mels + 3 * n_fft + 2) + 2 * (n_fft // 8)
     return {"flops": flops, "fixed_cycles": fixed,
-            "fft_flops": n_frames * f_fft, "ram_bytes": ram}
+            "fft_flops": n_frames * (f_pass1 + f_fft + f_unpack),
+            "ram_bytes": ram}
+
+
+FEATURE_LABELS = {"mfcc": "MFCC", "logspec": "log-spectrum", "raw": "raw samples"}
+
+
+def front_end_text(plan):
+    """One line naming the front end a plan describes."""
+    kind = plan.get("feature", "mfcc")
+    if kind == "raw":
+        return (f"raw samples, no FFT: {plan['slice_len']} per window, folded "
+                f"{plan['n_frames']} × {plan['n_out']} = {plan['window_ms']:.0f} ms window")
+    bands = (f"{plan['n_mels']} linear bands (no mel, no DCT)" if kind == "logspec"
+             else f"{plan['n_mels']} mel bands")
+    return (f"{FEATURE_LABELS.get(kind, kind)}: {plan['n_fft']}-point FFT, hop "
+            f"{plan['hop']}, {bands}, {plan['n_frames']} frames "
+            f"= {plan['window_ms']:.0f} ms window")
 
 
 def mfcc_cost(plan):
@@ -653,21 +628,20 @@ def stage_op_counts(ch, layers, ih, iw, ncls, pool_w):
     """What each pipeline stage has to compute, in the order the diagram
     draws them: one entry per fused conv+pool stage, then the dense stage.
 
-    One count per LOOP LEVEL of the kernels in dense_layer.cla, because the
-    levels cost different things and do not scale together -- conv2's
-    innermost tap is wrapped in an in_c loop that conv1 does not have, so a
-    model that only counts MACs gets the ratio between them wrong, and gets
-    it wrong differently at every channel count the search tries:
+    The two counts the timing model prices:
 
-      macs     `sum += (float)a[i] * (float)b[j]`    -- the fj body
-      taps     the same thing, named for what it is  -- an alias of macs
-      fi       one `row_ptr = (r + fi) * WIDTH`      -- once per 3 taps
-      inc      one in_c iteration: in_offset and filter_offset  (conv2 only)
-      windows  one completed accumulation: bias, ReLU, the float division,
-               the int16 conversion, the pool compare. For 2x1 pooling
-               there are two per pooled output -- the `sub` loop runs twice
-               before the kernel compares.
-      pooled   one stored output, with its own index arithmetic
+      macs     `sum += (float)*a++ * (float)*w++`  (`taps` is the same number)
+      windows  one completed accumulation: reset, the nine (or nine per
+               input channel) MACs, the bias add and the ReLU/pool compare.
+               For 2x1 pooling there are two per pooled output -- the `sub`
+               loop runs twice before the result is descaled and stored.
+
+    The rest describe the loop structure and are kept for the memory model
+    and for anyone refining the timing model with more measurements:
+
+      inc      one in_c iteration (conv2 only): nine MACs and a pointer step
+      fi       rows of the 3x3 window -- no longer a loop in the kernels
+      pooled   one stored output: one descale, one int16 conversion
       rows     one `pr` iteration, channels one `f` iteration
 
     Fused means the unpooled rows are never stored -- and never computed
@@ -702,8 +676,8 @@ def stage_op_counts(ch, layers, ih, iw, ncls, pool_w):
 
 
 # --------------------------------------------------------------------------
-# The two constants nothing above could state: solved from the anchors, now
-# that there is something to count the anchors' work with.
+# The constants nothing above could state: solved from the measurements, now
+# that there is something to count their work with.
 # --------------------------------------------------------------------------
 def _solve_flop_cycles(anchor):
     """Cycles per modelled float operation, from a measured MFCC time."""
@@ -713,89 +687,85 @@ def _solve_flop_cycles(anchor):
     return max(0.1, (target - o["fixed_cycles"]) / o["flops"])
 
 
-def level_costs(prim):
-    """What one iteration of each loop level costs, assembled from the
-    primitives -- i.e. the kernel read as instructions rather than as
-    mathematics. Straight off dense_layer.cla:
-
-      tap     `sum += (float)input[row_ptr + (c + fj)] *
-                      (float)filters[filter_offset + fi*FILTER_SIZE + fj]`
-              two loads, two int-to-float conversions, a multiply, an add,
-              two index adds (the multiply by FILTER_SIZE is constant and
-              strength-reduced), and the fj loop's own tail.
-      fi      `row_ptr = (r + fi) * WIDTH` -- an add, a multiply, a tail.
-      inc     in_offset and filter_offset, two multiplies and an add.
-      window  `sum = 0`, the bias multiply-add, the ReLU compare, the
-              DIVISION by the weight scale, the int16 conversion, the pool
-              compare, and the `sub` loop's tail.
-      pooled  the store, its index arithmetic, and the `c` loop's tail.
-    """
-    p = prim
-    return {
-        "taps": 2 * p["load"] + 2 * p["i2f"] + p["fmul"] + p["fadd"]
-                + 2 * p["iadd"] + p["loop"],
-        "fi": p["iadd"] + p["imul"] + p["loop"],
-        "inc": 2 * p["imul"] + p["iadd"] + p["loop"],
-        "windows": (p["load"] + p["i2f"] + p["fmul"] + p["fadd"]   # bias
-                    + p["fadd"]                                    # ReLU
-                    + p["div"] + p["f2i"] + p["fadd"] + p["loop"]),
-        "pooled": p["store"] + 2 * p["iadd"] + p["imul"] + p["loop"],
-        "rows": p["loop"],
-        "channels": 2 * p["imul"] + p["loop"],
-    }
+def _kernel_counts(channels):
+    k = KERNEL_SETUP
+    return stage_op_counts(channels, k["layers"], k["input_h"], k["input_w"],
+                           k["classes"], k["pool_w"])
 
 
-CLA_LEVELS = level_costs(CLA_PRIMITIVES)
-CPU_LEVELS = level_costs(CPU_PRIMITIVES)
+def _solve_kernel_costs(core):
+    """Cycles per MAC and per accumulation window on one core ("cpu" or
+    "cla"), from the two measurements marked "fit".
+
+    Two unknowns, two equations:  cycles = mac * MACs + window * windows.
+    The MAC count grows with channels squared (conv2) and the window count
+    linearly, so two channel counts far apart pin both down. On the CLA the
+    task overhead stage_cycles() adds is taken off first, so that the model
+    gives the measurement back exactly."""
+    rows = []
+    for m in KERNEL_MEASUREMENTS:
+        if not m["fit"]:
+            continue
+        counts = _kernel_counts(m["channels"])
+        cycles = m[core + "_ms"] / 1000.0 * KERNEL_SETUP["mhz"] * 1e6
+        if core == "cla":
+            cycles -= len(counts) * CLA_TASK_OVERHEAD
+        rows.append((float(sum(c["macs"] for c in counts)),
+                     float(sum(c["windows"] for c in counts)), cycles))
+    if len(rows) != 2:
+        raise ValueError("exactly two KERNEL_MEASUREMENTS must be marked fit")
+    (m1, w1, t1), (m2, w2, t2) = rows
+    det = m1 * w2 - m2 * w1
+    return {"taps": (t1 * w2 - t2 * w1) / det,
+            "windows": (m1 * t2 - m2 * t1) / det}
+
+
+CYC_FLOP = _solve_flop_cycles(MFCC_ANCHOR)
+# What one iteration of each priced loop level costs. Keyed like the counts
+# stage_op_counts() returns; a level that is not listed is not priced.
+CLA_LEVELS = _solve_kernel_costs("cla")
+CPU_LEVELS = _solve_kernel_costs("cpu")
+# Kept because pipeline_timing() multiplies by them. They were the single
+# fitted correction on a hand count when the model had one measurement; with
+# a measurement per core the level costs are fitted directly and these are 1.
+CLA_TUNE = 1.0
+CPU_TUNE = 1.0
 
 
 def _hand_count(counts, levels):
     return sum(sum(c.get(k, 0) * v for k, v in levels.items()) for c in counts)
 
 
-def _solve_tune(anchor):
-    """How much worse the compiled kernel is than the hand count above.
-
-    One number, from one measurement, and it is the only fitted quantity in
-    the conv model -- everything else is counted. It absorbs what cannot be
-    read off an instruction set: that this is an unoptimised build, that
-    locals live in memory rather than registers, and the pipeline stalls
-    that go with both. A value near 1 would mean the hand count was already
-    right; far from 1 means it is not, and the figure is worth looking at
-    rather than hiding, which is why the GUI reports it."""
-    counts = stage_op_counts(anchor["channels"], anchor["layers"],
-                             anchor["input_h"], anchor["input_w"],
-                             anchor["classes"], anchor["pool_w"])
-    hand = (_hand_count(counts, CLA_LEVELS)
-            + anchor["tasks"] * CLA_TASK_OVERHEAD)
-    target = anchor["ms"] / 1000.0 * anchor["mhz"] * 1e6
-    return max(0.1, target / hand) if hand > 0 else 1.0
+def stage_cycles(counts, on_cla):
+    levels = CLA_LEVELS if on_cla else CPU_LEVELS
+    tune = CLA_TUNE if on_cla else CPU_TUNE
+    return (_hand_count([counts], levels) * tune
+            + (CLA_TASK_OVERHEAD * CLA_TUNE if on_cla else 0.0))
 
 
-CYC_FLOP = _solve_flop_cycles(MFCC_ANCHOR)
-CLA_TUNE = _solve_tune(CLA_ANCHOR)
-
-
-def _validation_error(v):
+def _validation_error(m, core):
     """How far the model lands from a measurement it was NOT fitted to.
 
-    Deliberately not folded into the fit. A constant solved from every point
-    reproduces every point and proves nothing; the ones held back are the
-    only numbers here that can be wrong, and therefore the only ones that
-    say whether the model works. Re-fitting on them would trade the evidence
-    for a smaller residual."""
-    counts = stage_op_counts(v["channels"], v["layers"], v["input_h"],
-                             v["input_w"], v["classes"], v["pool_w"])
-    cycles = (_hand_count(counts, CLA_LEVELS) * CLA_TUNE
-              + v["tasks"] * CLA_TASK_OVERHEAD * CLA_TUNE)
-    predicted = 1000.0 * cycles / (v["mhz"] * 1e6)
-    return dict(v, predicted_ms=predicted, measured_ms=v["ms"],
-                error_pct=100.0 * (predicted - v["ms"]) / v["ms"])
+    Deliberately not folded into the fit. Prices solved from every point
+    reproduce every point and prove nothing; the one held back is the only
+    number here that can be wrong, and therefore the only one that says
+    whether the model works. Re-fitting on it would trade the evidence for a
+    smaller residual."""
+    on_cla = core == "cla"
+    cycles = sum(stage_cycles(c, on_cla) for c in _kernel_counts(m["channels"]))
+    predicted = 1000.0 * cycles / (KERNEL_SETUP["mhz"] * 1e6)
+    measured = m[core + "_ms"]
+    return {"channels": m["channels"], "core": core,
+            "note": KERNEL_SETUP["note"],
+            "predicted_ms": predicted, "measured_ms": measured,
+            "error_pct": 100.0 * (predicted - measured) / measured}
 
 
-VALIDATIONS = [_validation_error(v) for v in CLA_VALIDATIONS]
+VALIDATIONS = [_validation_error(m, core)
+               for m in KERNEL_MEASUREMENTS if not m["fit"]
+               for core in ("cpu", "cla")]
 # The band the held-out points actually span, which is the honest accuracy
-# claim -- not the anchor's zero residual.
+# claim -- not the fitted points' zero residual.
 VALIDATION_BAND = (min(x["error_pct"] for x in VALIDATIONS),
                    max(x["error_pct"] for x in VALIDATIONS))
 
@@ -804,28 +774,20 @@ def validation_note():
     """The provenance line the screen owes the reader: what the cycle costs
     were fitted on, and how well they predicted what they were not."""
     lo, hi = VALIDATION_BAND
-    chans = sorted(v["channels"] for v in VALIDATIONS)
+    fitted = sorted(m["channels"] for m in KERNEL_MEASUREMENTS if m["fit"])
+    held = sorted({v["channels"] for v in VALIDATIONS})
     span = sorted(v["measured_ms"] for v in VALIDATIONS)
-    return (f"cycle costs from an unoptimised (-O0) build · held out of the "
-            f"fit: {chans[0]} and {chans[-1]} channels, {span[0]:.0f}-"
-            f"{span[-1]:.0f} ms measured · model lands {lo:+.0f}% to {hi:+.0f}%")
-# The C28x conv path has no measurement of its own, so it is hand-counted
-# with the same structure and corrected by the same factor: same compiler,
-# same optimisation level, same source. What separates the two cores is
-# then the primitive table alone -- integer adds, integer multiplies, loop
-# tails -- rather than any fitted difference.
-CPU_TUNE = CLA_TUNE
+    return (f"cycle costs from a -O0 build, both cores measured · fitted on "
+            f"{fitted[0]} and {fitted[-1]} channels · held out: "
+            f"{', '.join(str(c) for c in held)} channels "
+            f"({span[0]:.1f}-{span[-1]:.1f} ms measured) · model lands "
+            f"{lo:+.1f}% to {hi:+.1f}%")
+
+
 # Reported, not used: cycles per MAC, for the parts of the GUI that quote a
 # single number.
 CYC_MAC_CLA = CLA_LEVELS["taps"] * CLA_TUNE
 CYC_MAC_CPU = CPU_LEVELS["taps"] * CPU_TUNE
-
-
-def stage_cycles(counts, on_cla):
-    levels = CLA_LEVELS if on_cla else CPU_LEVELS
-    tune = CLA_TUNE if on_cla else CPU_TUNE
-    return (_hand_count([counts], levels) * tune
-            + (CLA_TASK_OVERHEAD * CLA_TUNE if on_cla else 0.0))
 
 
 def pipeline_timing(plan, ch, layers, ih, iw, ncls, pool_w, cla_stage,
@@ -938,6 +900,43 @@ def pipeline_timing(plan, ch, layers, ih, iw, ncls, pool_w, cla_stage,
             "deadline_ms": period_ms, "window_ms": plan["window_ms"]}
 
 
+def is_tail_plan(flags):
+    """True when the CLA stages are a run at the END of the chain (or there
+    are none): once a stage is on the CLA, every later one is too.
+
+    `flags` is one bool per stage in execution order, dense last. These are
+    the only plans in which the CLA can run while the C28x has moved on to
+    the next window. A C28x stage AFTER a CLA stage needs that CLA stage's
+    result, so the C28x has to wait for it -- the stage has been moved to
+    the slower core and nothing overlaps."""
+    seen_cla = False
+    for on_cla in flags:
+        if seen_cla and not on_cla:
+            return False
+        seen_cla = seen_cla or bool(on_cla)
+    return True
+
+
+def assign_keeping_tail(flags, index, to_cla):
+    """`flags` with stage `index` moved to the CLA (to_cla) or the C28x, and
+    whatever else has to move so the result is still a tail plan:
+
+      to the CLA   -> every LATER stage goes to the CLA with it
+      to the C28x  -> every EARLIER stage goes to the C28x with it
+
+    Returns (new_flags, moved) where `moved` lists the other stages that
+    were carried along."""
+    out = [bool(f) for f in flags]
+    span = range(index, len(out)) if to_cla else range(0, index + 1)
+    moved = []
+    for i in span:
+        if out[i] != bool(to_cla):
+            out[i] = bool(to_cla)
+            if i != index:
+                moved.append(i)
+    return out, moved
+
+
 def timing_advice(t):
     """One sentence about where the frame actually goes, and what to do
     about it. Returns (severity, text) with severity in
@@ -949,9 +948,10 @@ def timing_advice(t):
                                            # chain offloaded
     gain = t["period_ms"] / full if full > 0 else 1.0
     cla_c, cpu_c = t["mac_cost"]["cla"], t["mac_cost"]["cpu"]
-    # On the measured build a MAC is about 2.5x dearer on the CLA, so
+    # A MAC costs more on the CLA than on the C28x (about 1.15x effective on
+    # the measured build; it was 2x before the kernels were rewritten), so
     # "offload it" is a trade, not a free win, and every branch below that
-    # recommends offloading has to say so.
+    # recommends offloading says so whenever the gap is 10% or more.
     slower = cla_c / cpu_c if cpu_c > 0 else 1.0
     trade = (f" The stages get slower there -- {slower:.1f}x per MAC on this "
              f"build -- so what you are buying is the overlap, not speed."
@@ -979,11 +979,26 @@ def timing_advice(t):
                     f"that it sets the pace, so a window now takes "
                     f"{t['period_ms']:.1f} ms instead of {fe:.1f}. Fewer "
                     f"channels, or fewer MACs per channel, buys that back.")
-        return ("warn", head +
-                f"Put every stage on the CLA first — that alone takes a "
-                f"window from {t['period_ms']:.1f} ms to {full:.1f} ms. If "
-                f"that is still over {fe:.1f} ms, the network itself is what "
-                f"has to come down.")
+        # Only recommend offloading everything when it actually helps. With
+        # the CLA slower per MAC, a split that keeps the first stage(s) on
+        # the C28x can already be the faster frame; "move it all" would then
+        # make the window LONGER, which is what this used to advise.
+        if gain >= 1.05:
+            return ("warn", head +
+                    f"Put every stage on the CLA first — that alone takes a "
+                    f"window from {t['period_ms']:.1f} ms to {full:.1f} ms. If "
+                    f"that is still over {fe:.1f} ms, the network itself is "
+                    f"what has to come down.")
+        budget = (f" That is {100.0 * t['period_ms'] / deadline:.0f}% of the "
+                  f"{deadline:.0f} ms window budget; fewer channels would "
+                  f"shorten it further only if you need to."
+                  if deadline else "")
+        return ("info",
+                f"Inference is the longer half: {inf:.2f} ms against "
+                f"{fe:.1f} ms of feature extraction, so the network sets the "
+                f"pace. The current split is already the faster one: a "
+                f"window every {t['period_ms']:.1f} ms, against {full:.1f} ms "
+                f"with every stage on the CLA." + budget)
 
     if pct >= 60.0:
         if t["all_cla"]:
@@ -1982,10 +1997,10 @@ def write_array(f, name, arr, mode, is_label=False):
     ctype = "float" if mode == "FLOAT32" else QMAX[mode][2]
     vals = ([f"{v:.8f}f" for v in q] if mode == "FLOAT32"
             else [str(int(v)) for v in q])
-    f.write(f"// [{shape}]\n")
+    f.write(f"/** @brief {name}, shape [{shape}]. */\n")
     if mode != "FLOAT32":
         f.write(f"const float {name}_scale = {scale:.10f}f;   "
-                f"// real = value / {name}_scale\n")
+                f"/**< real = value / {name}_scale */\n")
     f.write(f"const {ctype} {name}[{len(q)}] = {{\n")
     for i in range(0, len(vals), 10):
         f.write("    " + ", ".join(vals[i:i + 10])
@@ -2020,29 +2035,137 @@ FIRMWARE_DIR = "CNN_Inference_Edge-AI_with_CLA"
 FIRMWARE_TEMPLATES = ("definitions.h", "weights.h", "main.c")
 
 
-def find_firmware_templates():
-    """Where to read definitions.h / weights.h / main.c from, in order of
-    preference:
+# Where a firmware project may keep the files this tool reads and writes,
+# relative to the project folder. The project used to be flat (everything
+# next to main.c); it now keeps main.c in the root, headers in
+# application/include and sources in application/source. Both are accepted,
+# and so is the flat snapshot shipped inside a build.
+PROJECT_SUBDIRS = ("", os.path.join("application", "include"),
+                   os.path.join("application", "source"))
 
-      1. EDGE_AI_FIRMWARE_DIR, for a checkout kept somewhere else
-      2. CNN_Inference_Edge-AI_with_CLA/ under the current directory
-      3. the same, beside the application
-      4. the snapshot shipped inside the build
 
-    1-3 mean an installed build still patches YOUR checkout, so hand edits to
-    main.c survive, exactly as when running from source. 4 is the fallback
-    that keeps the app usable with no checkout at all. Returns None when even
-    the snapshot is missing.
-    """
-    candidates = []
+def project_copies(project_dir, name):
+    """Every copy of `name` in the places a project may keep it."""
+    out = []
+    for sub in PROJECT_SUBDIRS:
+        p = os.path.join(project_dir, sub, name)
+        if os.path.isfile(p):
+            out.append(p)
+    return out
+
+
+def project_file(project_dir, name):
+    """The project's copy of `name`, or None when it has none."""
+    found = project_copies(project_dir, name)
+    return found[0] if found else None
+
+
+def project_target(project_dir, name):
+    """Where `name` belongs in this project: where it already is, and
+    otherwise where its kind goes -- headers in application/include when the
+    project has that folder, everything else (and everything in a flat
+    project) in the root."""
+    found = project_file(project_dir, name)
+    if found:
+        return found
+    inc = os.path.join(project_dir, "application", "include")
+    if name.endswith(".h") and os.path.isdir(inc):
+        return os.path.join(inc, name)
+    return os.path.join(project_dir, name)
+
+
+def project_duplicates(project_dir, files):
+    """{name: [paths]} for each of `files` the project holds more than once.
+
+    Two copies of a model header are worse than none. main.c sits in the
+    root and finds a header next to itself first; the kernels sit in
+    application/source and find the one in application/include. With a
+    different NUM_FILTERS in each, both translation units compile, the link
+    succeeds, and the two halves of the firmware disagree about every array
+    size. Nothing may be ported into a project in that state."""
+    out = {}
+    for name in files:
+        found = project_copies(project_dir, name)
+        if len(found) > 1:
+            out[name] = found
+    return out
+
+
+def _has_templates(cand):
+    return all(project_file(cand, f) for f in FIRMWARE_TEMPLATES)
+
+
+def settings_path():
+    """Per-user settings, outside the app folder: a release may be unzipped
+    anywhere, or installed where it cannot write, and the choice must survive
+    an update that replaces the whole folder."""
+    base = os.environ.get("APPDATA") or os.path.expanduser("~")
+    return os.path.join(base, "ADOT", "settings.json")
+
+
+def load_settings():
+    """{} when there is no settings file or it cannot be read."""
+    try:
+        with open(settings_path(), encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_settings(**changed):
+    data = load_settings()
+    data.update(changed)
+    path = settings_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
+def resolve_ccs_project(folder):
+    """`folder` as a CCS project: the folder itself, or the
+    CNN_Inference_Edge-AI_with_CLA/ inside it (picking the folder that holds
+    the checkout is an easy slip). None when neither has the templates."""
+    for cand in (folder, os.path.join(folder, FIRMWARE_DIR)):
+        if cand and _has_templates(cand):
+            return os.path.abspath(cand)
+    return None
+
+
+def _project_candidates():
+    """Where a CCS project may be, in order of preference:
+
+      1. the folder picked in the GUI (CCS project...), kept in settings
+      2. EDGE_AI_FIRMWARE_DIR, for a checkout kept somewhere else
+      3. CNN_Inference_Edge-AI_with_CLA/ under the current directory
+      4. the same, beside the application
+
+    1 is what makes a release work wherever the project lives: the exe needs
+    no environment and no fixed layout, only one pick."""
+    out = []
+    saved = load_settings().get("ccs_project")
+    if saved:
+        out.append(saved)
     env = os.environ.get("EDGE_AI_FIRMWARE_DIR")
     if env:
-        candidates.append(env)
-    candidates += [os.path.join(os.getcwd(), FIRMWARE_DIR),
-                   os.path.join(app_dir(), FIRMWARE_DIR),
-                   resource_path("firmware_templates")]
-    for cand in candidates:
-        if all(os.path.isfile(os.path.join(cand, f)) for f in FIRMWARE_TEMPLATES):
+        out.append(env)
+    out += [os.path.join(os.getcwd(), FIRMWARE_DIR),
+            os.path.join(app_dir(), FIRMWARE_DIR)]
+    return out
+
+
+def find_firmware_templates():
+    """Where to read definitions.h / weights.h / main.c from: the CCS
+    project (see _project_candidates), and failing that the snapshot shipped
+    inside the build.
+
+    A project means an installed build still patches YOUR checkout, so hand
+    edits to main.c survive, exactly as when running from source. The
+    snapshot is the fallback that keeps the app usable with no checkout at
+    all. Returns None when even the snapshot is missing.
+    """
+    for cand in _project_candidates() + [resource_path("firmware_templates")]:
+        if _has_templates(cand):
             return cand
     return None
 
@@ -2052,14 +2175,8 @@ def find_ccs_project():
     find_firmware_templates(), minus the snapshot shipped inside a build --
     that one is read-only reference data, not a project anyone compiles.
     None when there is no checkout to write to."""
-    candidates = []
-    env = os.environ.get("EDGE_AI_FIRMWARE_DIR")
-    if env:
-        candidates.append(env)
-    candidates += [os.path.join(os.getcwd(), FIRMWARE_DIR),
-                   os.path.join(app_dir(), FIRMWARE_DIR)]
-    for cand in candidates:
-        if all(os.path.isfile(os.path.join(cand, f)) for f in FIRMWARE_TEMPLATES):
+    for cand in _project_candidates():
+        if _has_templates(cand):
             return os.path.abspath(cand)
     return None
 
@@ -2067,25 +2184,32 @@ def find_ccs_project():
 # What an export ports into the CCS project. The export folder keeps its own
 # copy of every one of them; the project only ever holds the latest model.
 PORTED_FILES = ("definitions.h", "weights.h", "main.c",
-                "cla_pipeline_config.h", "feature_tables.h")
+                "cla_pipeline_config.h", "feature_tables.h", "test_inputs.h",
+                "golden_vectors.h")
 PORT_STAMP = "ADOT_LAST_EXPORT.txt"
 
 
 def port_to_ccs(embedded_dir, project_dir, files=PORTED_FILES):
     """Replaces the project's copy of each file in `files` with the one in
-    embedded_dir. Each file is staged next to its target and swapped in with
-    os.replace, so an interrupted port never leaves a half-written header for
-    CCS to compile. Returns the names that were ported."""
+    embedded_dir, WHERE THE PROJECT KEEPS IT (see project_target): a header
+    that lives in application/include is replaced there, never written a
+    second time into the root. Each file is staged next to its target and
+    swapped in with os.replace, so an interrupted port never leaves a
+    half-written header for CCS to compile. Returns the ported files as
+    paths relative to the project, for the log.
+
+    Callers must check project_duplicates() first; this function ports into
+    whatever copy project_file() finds."""
     done = []
     for name in files:
         src = os.path.join(embedded_dir, name)
         if not os.path.isfile(src):
             continue
-        dst = os.path.join(project_dir, name)
+        dst = project_target(project_dir, name)
         tmp = dst + ".adot_tmp"
         shutil.copyfile(src, tmp)
         os.replace(tmp, dst)
-        done.append(name)
+        done.append(os.path.relpath(dst, project_dir).replace(os.sep, "/"))
     return done
 
 
@@ -2124,23 +2248,223 @@ def patch_c_array(text, decl, bracket, values):
     return new_text
 
 
+# ---------------------------------------------------------------------------
+# On-board test inputs
+# ---------------------------------------------------------------------------
+# The firmware's test loop needs something to classify. Three sources,
+# named by TEST_GOLDEN_ADC in test_inputs.h:
+#
+#   2 raw ADC windows of THIS dataset, written to golden_vectors.h at export
+#     from the "golden" windows adot_dataset.py keeps in the .npz. They run
+#     the whole chain, feature extraction included, for any dataset that was
+#     prepared from recordings.
+#   1 raw ADC slices kept in the project as golden_vector_*.h. The same
+#     thing, hand-made, for the two datasets this project started with; used
+#     when a dataset has no golden windows of its own.
+#   0 (below) for everything else.
+#   * feature matrices picked from the dataset's validation set at export
+#     time (test_inputs.h, below). They exist for ANY dataset and class
+#     count; they are written straight into the network's input, so they
+#     test the network and not the MFCC.
+#
+# test_inputs.h is written on every export and tells main.c which to use
+# (TEST_GOLDEN_ADC). The raw slices are chosen only when the dataset is
+# recognisably the one they were cut from: same class names in the same
+# order, same slice length. Anything else -- a vibration dataset, another
+# class count, another window -- gets the feature inputs.
+GOLDEN_ADC_SETS = {
+    ("normal", "abnormal"): 16896,                # MIMII fan
+    ("healthy", "bearing", "propeller"): 16896,   # BLDC
+}
+
+
+def has_golden_adc(class_names, slice_len):
+    key = tuple(str(c).strip().lower() for c in class_names)
+    return GOLDEN_ADC_SETS.get(key) == int(slice_len)
+
+
+GOLDEN_FW_BITS = 12        # mfcc_extract.c: (code - mean) / FEAT_ADC_SCALE (2048)
+
+
+def pick_golden(labels, predicted, num_classes):
+    """One golden window per class: the first the model classifies correctly,
+    failing that the first of the class (the board will then, rightly, report
+    a miss). None unless EVERY class has one -- the firmware's loop steps
+    through the classes."""
+    picks = []
+    for lab in range(num_classes):
+        idx = [i for i in range(len(labels)) if int(labels[i]) == lab]
+        if not idx:
+            return None
+        picks.append(next((i for i in idx if int(predicted[i]) == lab), idx[0]))
+    return picks
+
+
+def build_golden_vectors_h(codes, labels, sources, class_names, source=""):
+    """golden_vectors.h: one raw ADC window per class, for the firmware's
+    whole-chain test (TEST_GOLDEN_ADC 2). `codes` is [n][slice_len] of
+    12-bit ADC codes."""
+    codes = np.asarray(codes)
+    if codes.ndim != 2 or len(codes) != len(labels) or not len(codes):
+        raise ValueError("golden windows and labels do not match")
+    if codes.min() < 0 or codes.max() > (1 << GOLDEN_FW_BITS) - 1:
+        raise ValueError("golden windows are not 12-bit ADC codes")
+    n, slice_len = codes.shape
+    L = ["/**", " * @file golden_vectors.h",
+         " * @brief Held-out raw ADC windows, one per class, for the whole-chain test.",
+         " * @note Generated by ADOT on every export; do not edit."]
+    if source:
+        L.append(f" * @details Dataset: {c_comment_text(source)}.")
+    L.append(" * @par Rows")
+    for lab, src in zip(labels, sources):
+        name = class_names[int(lab)] if int(lab) < len(class_names) else lab
+        L.append(f" * - {c_comment_text(name)}: {c_comment_text(src)}")
+    L += [" */", "#ifndef GOLDEN_VECTORS_H", "#define GOLDEN_VECTORS_H", "",
+          "#include <stdint.h>", "",
+          f"#define GOLDEN_N          {n} /**< Number of windows. */",
+          f"#define GOLDEN_SLICE_LEN  {slice_len} /**< ADC samples per window. */", "",
+          f"static const uint16_t golden_labels[GOLDEN_N] = {{ "
+          + ", ".join(str(int(v)) for v in labels) + " }; /**< Class of each window. */", "",
+          "/** @brief 12-bit ADC codes, one row per window. */",
+          "static const uint16_t golden_adc[GOLDEN_N][GOLDEN_SLICE_LEN] = {"]
+    for row in codes:
+        L.append("  {")
+        L.append(format_int_array_body(row))
+        L.append("  },")
+    L += ["};", "", "#endif", ""]
+    return "\n".join(L)
+
+
+def c_comment_text(s):
+    """`s` as ASCII that cannot end the C comment it is written into."""
+    return str(s).encode("ascii", "replace").decode().replace("*/", "* /")
+
+
+def quantize_input(features, input_scale):
+    """Features -> the int16 the firmware feeds the network: scaled by
+    INPUT_SCALE, clamped, truncated towards zero. The same three steps, in
+    the same order, as the loop after mfcc_extract() in main.c."""
+    v = np.asarray(features, dtype=np.float32) * np.float32(input_scale)
+    v = np.clip(v, -32768.0, 32767.0)
+    return np.trunc(v).astype(np.int16)
+
+
+def template_input_scale(definitions_text):
+    m = re.search(r'#define\s+INPUT_SCALE\s+([0-9.]+)f?', definitions_text)
+    if not m:
+        raise ValueError("#define INPUT_SCALE not found in template")
+    return float(m.group(1))
+
+
+def pick_test_inputs(X, y, num_classes, is_correct=None):
+    """One sample per class from (X, y): the first one `is_correct(i)`
+    accepts, and failing that the first of the class at all -- a class the
+    model gets wrong everywhere still needs an entry, and the board will
+    then (rightly) report it as a miss. Classes with no sample are skipped.
+    Returns [(label, features)], in label order."""
+    out = []
+    for lab in range(num_classes):
+        idx = [i for i in range(len(y)) if int(y[i]) == lab]
+        if not idx:
+            continue
+        good = next((i for i in idx if is_correct is None or is_correct(i)),
+                    idx[0])
+        out.append((lab, np.asarray(X[good])))
+    return out
+
+
+def build_test_inputs_h(samples, class_names, input_h, input_w, input_scale,
+                        golden_adc, source=""):
+    """test_inputs.h: what main.c's test loop feeds the network when the
+    project has no raw recordings of this dataset. `samples` is
+    [(label, features[input_h][input_w])] in float feature units."""
+    if not samples:
+        raise ValueError("no test inputs: the validation set is empty")
+    names = [str(c) for c in class_names]
+    for n in names:
+        if '"' in n or "\\" in n:
+            raise ValueError(f"class name {n!r} cannot be written as a C string")
+    L = ["/**", " * @file test_inputs.h",
+         " * @brief On-board test inputs: one int16 validation sample per class.",
+         " * @note Generated by ADOT on every export; do not edit.",
+         f" * @details Model input {input_h}x{input_w}, {len(names)} classes"
+         + (f", dataset {c_comment_text(source)}" if source else "") + ".",
+         " */",
+         "#ifndef TEST_INPUTS_H", "#define TEST_INPUTS_H", "",
+         "#include <stdint.h>", "",
+         f"#define TEST_GOLDEN_ADC   {int(golden_adc)} /**< 2: golden_vectors.h, 1: golden_vector_*.h, 0: test_inputs[]. */",
+         f"#define TEST_N_CLASSES    {len(names)} /**< Model classes. */",
+         f"#define TEST_N_INPUTS     {len(samples)} /**< Rows in test_inputs[]. */",
+         f"#define TEST_INPUT_H      {input_h} /**< Input frames. */",
+         f"#define TEST_INPUT_W      {input_w} /**< Features per frame. */", "",
+         f"static const char *const test_class_names[{len(names)}] = {{ "
+         + ", ".join(f'"{n}"' for n in names) + " }; /**< Class names. */", "",
+         f"static const uint16_t test_labels[{len(samples)}] = {{ "
+         + ", ".join(str(int(lab)) for lab, _ in samples) + " }; /**< Class of each row. */", "",
+         "/** @brief Network inputs: features * INPUT_SCALE, clamped, truncated. */",
+         f"static const int16_t test_inputs[{len(samples)}][{input_h * input_w}] = {{"]
+    for lab, feat in samples:
+        feat = np.asarray(feat).reshape(-1)
+        if feat.size != input_h * input_w:
+            raise ValueError(f"test input for class {lab} has {feat.size} "
+                             f"values, expected {input_h * input_w}")
+        q = quantize_input(feat, input_scale)
+        L.append("  {")
+        L.append(format_int_array_body(q))
+        L.append("  },")
+    L += ["};", "", "#endif", ""]
+    return "\n".join(L)
+
+
 def find_feature_config(dataset_path):
     """Prepare_features.py writes folds/<name>.npz and feature_config.json in
     its working directory -- i.e. next to folds/. Look there, then next to the
     .npz itself. Returns the path or None."""
     d = os.path.dirname(os.path.abspath(dataset_path))
-    for cand in (os.path.join(os.path.dirname(d), "feature_config.json"),
-                 os.path.join(d, "feature_config.json")):
-        if os.path.isfile(cand):
-            return cand
+    # raw_config.json: what raw-input datasets were written with before this
+    # program understood "feature": "raw".
+    for name in ("feature_config.json", "raw_config.json"):
+        for cand in (os.path.join(os.path.dirname(d), name), os.path.join(d, name)):
+            if os.path.isfile(cand):
+                return cand
     return None
+
+
+FEATURE_KINDS = ("mfcc", "logspec")
+
+
+def feature_kind(cfg):
+    """Which front end a feature_config.json describes. Files written before
+    the key existed are MFCC."""
+    return str(cfg.get("feature", "mfcc"))
+
+
+def feature_n_out(cfg):
+    """Width of the feature matrix (= the network's input width)."""
+    if feature_kind(cfg) == "logspec":
+        return len(cfg["band_edges"]) - 1
+    return cfg["n_mfcc"] - int(cfg["drop_c0"])
+
+
+def band_filters(cfg):
+    """Log-spectrum bands in the layout the mel filters use: band b is the
+    mean of the power bins band_edges[b] .. band_edges[b+1]-1. The edges are
+    read from feature_config.json, never recomputed, so they are the ones the
+    dataset was built with."""
+    edges = [int(e) for e in cfg["band_edges"]]
+    if (len(edges) < 2 or edges[0] < 0 or edges[-1] > cfg["n_fft"] // 2 + 1
+            or any(b <= a for a, b in zip(edges, edges[1:]))):
+        raise ValueError(f"band_edges {edges} are not increasing bins within "
+                         f"0..{cfg['n_fft'] // 2 + 1}")
+    return [(a, np.full(b - a, 1.0 / (b - a), dtype=np.float64))
+            for a, b in zip(edges, edges[1:])]
 
 
 def build_feature_tables_h(cfg, mu, sigma):
     """Returns the text of feature_tables.h (the MFCC tables mfcc_extract.c runs
     on): Hann window, sparse mel filterbank, reduced DCT-II and the z-score
     mu/sigma. A port of Sound_Analyses/generate_c2000_tables.py -- same
-    librosa/scipy calls, same order and formatting -- so the output matches
+    librosa/scipy calls, same order and number formatting -- so the values match
     that script's for the same feature_config.json + dataset. Unlike the
     script (which always reads folds/dataset.npz), mu/sigma come from
     whichever dataset the model was actually trained on."""
@@ -2151,8 +2475,18 @@ def build_feature_tables_h(cfg, mu, sigma):
     if cfg["center"]:
         raise ValueError("feature_config.json has center=True; the C2000 cannot "
                          "pad a live stream, features must be built with center=False")
-    n_fft, n_mels = cfg["n_fft"], cfg["n_mels"]
-    n_out = cfg["n_mfcc"] - int(cfg["drop_c0"])
+    kind = feature_kind(cfg)
+    if kind == "raw":
+        raise ValueError("this dataset feeds raw samples to the network; the "
+                         "firmware has no raw-input front end yet, so no "
+                         "feature_tables.h can be written for it")
+    if kind not in FEATURE_KINDS:
+        raise ValueError(f"feature_config.json describes a '{kind}' front end; "
+                         f"mfcc_extract.c only computes {' / '.join(FEATURE_KINDS)}")
+    logspec = kind == "logspec"
+    n_fft = cfg["n_fft"]
+    n_out = feature_n_out(cfg)
+    n_mels = n_out if logspec else cfg["n_mels"]
     n_frames = cfg["n_frames"]
     if len(mu) != n_out or len(sigma) != n_out:
         raise ValueError(f"dataset mu/sigma have {len(mu)} values, feature_config.json "
@@ -2160,10 +2494,10 @@ def build_feature_tables_h(cfg, mu, sigma):
 
     hann = get_window("hann", n_fft, fftbins=True).astype(np.float64)
 
-    fb = librosa.filters.mel(sr=cfg["sr"], n_fft=n_fft, n_mels=n_mels,
-                             fmin=cfg["fmin"], fmax=cfg["fmax"], htk=cfg["htk"],
-                             norm="slaney")
-    mel_filters = []
+    fb = np.zeros((0, 0)) if logspec else librosa.filters.mel(
+        sr=cfg["sr"], n_fft=n_fft, n_mels=n_mels,
+        fmin=cfg["fmin"], fmax=cfg["fmax"], htk=cfg["htk"], norm="slaney")
+    mel_filters = band_filters(cfg) if logspec else []
     for i in range(fb.shape[0]):
         nz = np.nonzero(fb[i])[0]
         if len(nz) == 0:
@@ -2172,8 +2506,11 @@ def build_feature_tables_h(cfg, mu, sigma):
             raise ValueError(f"mel filter {i} is not contiguous; sparse storage invalid")
         mel_filters.append((int(nz.min()), fb[i, nz.min():nz.max() + 1].astype(np.float64)))
 
-    full = dct(np.eye(n_mels), type=2, norm="ortho", axis=0)[:cfg["n_mfcc"]]
-    dct_mat = full[1:] if cfg["drop_c0"] else full
+    if logspec:
+        dct_mat = None
+    else:
+        full = dct(np.eye(n_mels), type=2, norm="ortho", axis=0)[:cfg["n_mfcc"]]
+        dct_mat = full[1:] if cfg["drop_c0"] else full
 
     def c_array(name, arr):
         vals = ", ".join(f"{v:.10f}f" for v in arr)
@@ -2182,73 +2519,68 @@ def build_feature_tables_h(cfg, mu, sigma):
     total_nnz = sum(len(w) for _, w in mel_filters)
     n_fft_bins = n_fft // 2 + 1
     L = []
+    L.append("/**")
+    L.append(" * @file feature_tables.h")
+    L.append(f" * @brief {'Log-spectrum' if logspec else 'MFCC'} tables and z-score stats for mfcc_extract.c.")
+    L.append(" * @note Generated by ADOT from feature_config.json on every export; do not edit.")
+    L.append(" */")
     L.append("#ifndef FEATURE_TABLES_H")
     L.append("#define FEATURE_TABLES_H")
     L.append("")
     L.append("#include <stdint.h>")
     L.append("")
-    L.append("// generate_c2000_tables.py ile feature_config.json'dan uretildi.")
-    L.append("// Bu tablolar egitimde kullanilan MFCC boru hattinin BIREBIR ayni")
-    L.append("// parametreleriyle hesaplanmistir. Elle degistirmeyin.")
+    L.append(f"#define FEAT_SR          {cfg['sr']} /**< Sample rate (Hz). */")
+    L.append(f"#define FEAT_N_FFT       {n_fft} /**< FFT length. */")
+    L.append(f"#define FEAT_HOP         {cfg['hop']} /**< Hop between frames. */")
+    L.append(f"#define FEAT_N_MELS      {n_mels} /**< {'Linear bands' if logspec else 'Mel bands'}. */")
+    L.append(f"#define FEAT_N_FFT_BINS  {n_fft_bins} /**< n_fft/2 + 1. */")
+    if logspec:
+        L.append(f"#define FEAT_N_OUT       {n_out} /**< Bands per frame (no DCT). */")
+        L.append("#define FEAT_USE_DCT     0 /**< Skip the DCT. */")
+    else:
+        L.append(f"#define FEAT_N_OUT       {n_out} /**< MFCCs per frame (C0 {'dropped' if cfg['drop_c0'] else 'kept'}). */")
+    L.append(f"#define FEAT_N_FRAMES    {n_frames} /**< Frames per window. */")
+    L.append(f"#define FEAT_SLICE_LEN   {cfg['slice_len']} /**< Samples per window. */")
+    L.append("#define FEAT_AMIN        1e-10f /**< Power floor (librosa default). */")
+    L.append("#define FEAT_TOP_DB      80.0f /**< Dynamic range (librosa default). */")
+    L.append(f"#define FEAT_CLIP        {cfg['clip']:.1f}f /**< Z-score clip. */")
     L.append("")
-    L.append(f"#define FEAT_SR          {cfg['sr']}")
-    L.append(f"#define FEAT_N_FFT       {n_fft}")
-    L.append(f"#define FEAT_HOP         {cfg['hop']}")
-    L.append(f"#define FEAT_N_MELS      {n_mels}")
-    L.append(f"#define FEAT_N_FFT_BINS  {n_fft_bins}   // n_fft/2 + 1, DC..Nyquist")
-    L.append(f"#define FEAT_N_OUT       {n_out}        // MFCC katsayi sayisi (C0 {'HARIC' if cfg['drop_c0'] else 'DAHIL'})")
-    L.append(f"#define FEAT_N_FRAMES    {n_frames}     // dilim basina cerceve sayisi")
-    L.append(f"#define FEAT_SLICE_LEN   {cfg['slice_len']}   // dilim basina orneksec")
-    L.append("#define FEAT_AMIN        1e-10f  // librosa power_to_db varsayilani")
-    L.append("#define FEAT_TOP_DB      80.0f   // librosa power_to_db varsayilani")
-    L.append(f"#define FEAT_CLIP        {cfg['clip']:.1f}f")
-    L.append("")
-    L.append("// --- 12-bit ADC on-uc (0..4095) --------------------------------")
-    L.append("// DC giderme: tamponun ORTALAMASINI cikar. Filtre yok, yerlesme")
-    L.append("// suresi yok, tek gecis. Kartinizin gercek bias'i 2048'den kaysa")
-    L.append("// bile otomatik dogru olur.")
-    L.append("//")
-    L.append("//   float mean = 0; for(i) mean += adc[i]; mean /= FEAT_SLICE_LEN;")
-    L.append("//   for(i) x[i] = (adc[i] - mean) / FEAT_ADC_SCALE;")
-    L.append("#define FEAT_ADC_SCALE       2048.0f   // (adc-mean)/SCALE -> ~[-1,1]")
-    L.append("// Hann penceresi, cerceve orneklerine eleman-eleman carpilir")
+    L.append("#define FEAT_ADC_SCALE       2048.0f /**< (adc - mean) / scale gives ~[-1, 1]. */")
+    L.append("/** @brief Hann window. */")
     L.append(c_array("feat_hann_window", hann))
     L.append("")
-    L.append("// Mel filtre bankasi -- her filtre FFT guc spektrumunun (|X|^2)")
-    L.append("// ardisik bir araligiyla nokta carpimidir. start_bin, o araligin")
-    L.append("// ilk FFT bin indeksidir (0 = DC). Toplam agirlik sayisi FEAT_N_MELS")
-    L.append("// filtreden kucuktur cunku ucgen filtreler seyrektir.")
-    L.append(f"#define FEAT_MEL_NNZ {total_nnz}")
+    L.append(f"#define FEAT_MEL_NNZ {total_nnz} /**< Total filter weights. */")
     L.append("")
+    L.append("/** @brief First FFT bin of each filter. */")
     L.append("static const uint16_t feat_mel_start[FEAT_N_MELS] = {")
     L.append("    " + ", ".join(str(s) for s, _ in mel_filters) + "\n};")
     L.append("")
+    L.append("/** @brief Bins per filter. */")
     L.append("static const uint16_t feat_mel_len[FEAT_N_MELS] = {")
     L.append("    " + ", ".join(str(len(w)) for _, w in mel_filters) + "\n};")
     L.append("")
     all_weights = np.concatenate([w for _, w in mel_filters])
-    L.append("// tum filtrelerin agirliklari ucucu ucuca; her filtre icin")
-    L.append("// feat_mel_start[i] .. feat_mel_start[i]+feat_mel_len[i] araligindaki")
-    L.append("// FFT power bin'leri, feat_mel_weights icindeki karsilik gelen")
-    L.append("// feat_mel_len[i] agirlikla carpilip toplanir.")
     offsets = np.cumsum([0] + [len(w) for _, w in mel_filters])[:-1]
+    L.append("/** @brief Offset of each filter in feat_mel_weights. */")
     L.append("static const uint16_t feat_mel_offset[FEAT_N_MELS] = {")
     L.append("    " + ", ".join(str(o) for o in offsets) + "\n};")
     L.append("")
+    L.append("/** @brief All filter weights, back to back. */")
     L.append(c_array("feat_mel_weights", all_weights))
     L.append("")
-    L.append(f"// Indirgenmis DCT-II (ortho) matrisi, {dct_mat.shape[0]}x{dct_mat.shape[1]}.")
-    L.append("// mfcc[i] = sum_j dct_matrix[i][j] * log_mel[j]")
-    L.append("static const float feat_dct_matrix[FEAT_N_OUT][FEAT_N_MELS] = {")
-    for row in dct_mat:
-        L.append("    { " + ", ".join(f"{v:.10f}f" for v in row) + " },")
-    L.append("};")
-    L.append("")
-    L.append("// z-score normalizasyonu: (mfcc - mu) / sigma, sonra +-FEAT_CLIP'e kirp")
+    if dct_mat is not None:
+        L.append(f"/** @brief Reduced DCT-II (ortho), {dct_mat.shape[0]}x{dct_mat.shape[1]}. */")
+        L.append("static const float feat_dct_matrix[FEAT_N_OUT][FEAT_N_MELS] = {")
+        for row in dct_mat:
+            L.append("    { " + ", ".join(f"{v:.10f}f" for v in row) + " },")
+        L.append("};")
+        L.append("")
+    L.append("/** @brief Z-score mean of the training set. */")
     L.append(c_array("feat_mu", np.asarray(mu, dtype=np.float64)))
+    L.append("/** @brief Z-score std of the training set. */")
     L.append(c_array("feat_sigma", np.asarray(sigma, dtype=np.float64)))
     L.append("")
-    L.append("#endif // FEATURE_TABLES_H")
+    L.append("#endif")
     # trailing newline: the script's file ended without one, which made the
     # TI compiler warn (#1 "last line of file ends without a newline")
     return "\n".join(L) + "\n"
@@ -2479,38 +2811,26 @@ class TrainingThread(QThread):
                          .replace("≥", ">=").replace("—", "--")
                          .replace("’", "'")
                          .encode("ascii", "replace").decode("ascii"))
-            note = ("//\n// --- ZAMAN BUTCESI (GUI cevrim modeli, olculmus "
-                    "degil) ------------\n"
-                    + "".join(f"// {ascii_only(ln)}\n"
+            note = (" * @par Timing (model, not measured)\n"
+                    + "".join(f" * - {ascii_only(ln).replace('*/', '* /')}\n"
                               for ln in self.timing_note))
         with open(path, "w") as f:
             f.write(
-                "#ifndef CLA_PIPELINE_CONFIG_H\n#define CLA_PIPELINE_CONFIG_H\n\n"
-                "// ADOT GUI tarafindan uretildi. 1 = asama CLA'da,\n"
-                "// 0 = asama C28x CPU'da (convolution.c'deki ikizi calisir --\n"
-                "// matematik birebir ayni, sonuc degismez).\n"
-                "//\n"
-                "//   MFCC : HER ZAMAN CPU (mfcc_extract.c) -- CLA'nin 2KB program\n"
-                "//          RAM'ine FFT/log/DCT sigmaz, offload edilebilir degil.\n"
-                "//   S1   : conv1 + relu + pool1 (fused)\n"
-                "//   S2   : conv2 + relu + pool2 (fused)\n"
-                "//   S3   : dense / FC\n"
-                "//\n"
-                "// BELLEK: CLA program RAM'i (RAMLS5_PROG) 2048 byte ve uc asama\n"
-                "// birlikte 2042 byte tutuyor -- bu yuzden ucu de 1 ise hepsi TEK\n"
-                "// gorevde toplanir (CLA_SINGLE_TASK). Biri CPU'ya alininca o kod\n"
-                "// hic derlenmez, acilan yerle asama basina ayri gorev kullanilir.\n"
-                "// CLA veri RAM'i (RAMLS_0_1_2_3_4) 10240 byte; CPU'ya alinan\n"
-                "// asamanin agirlik/tampon kopyasi bu havuzdan cikar.\n"
+                "/**\n"
+                " * @file cla_pipeline_config.h\n"
+                " * @brief CPU/CLA split of the CNN stages (1 = CLA, 0 = CPU).\n"
+                " * @note Generated by ADOT on every export; do not edit.\n"
                 + note +
-                f"#define CLA_STAGE_CONV1_POOL1  {s1}\n"
-                f"#define CLA_STAGE_CONV2_POOL2  {s2}\n"
-                f"#define CLA_STAGE_DENSE        {s3}\n\n"
-                "// --- turetilmis yardimcilar (elle degistirmeyin) ---------------\n"
+                " */\n"
+                "#ifndef CLA_PIPELINE_CONFIG_H\n#define CLA_PIPELINE_CONFIG_H\n\n"
+                f"#define CLA_STAGE_CONV1_POOL1  {s1} /**< S1: conv1 + ReLU + pool1. */\n"
+                f"#define CLA_STAGE_CONV2_POOL2  {s2} /**< S2: conv2 + ReLU + pool2. */\n"
+                f"#define CLA_STAGE_DENSE        {s3} /**< S3: dense layer. */\n\n"
+                "/** @brief All stages on the CLA: they run as one task. */\n"
                 "#define CLA_SINGLE_TASK  (CLA_STAGE_CONV1_POOL1 && CLA_STAGE_CONV2_POOL2 && CLA_STAGE_DENSE)\n"
-                "#define CLA_ANY_STAGE    (CLA_STAGE_CONV1_POOL1 || CLA_STAGE_CONV2_POOL2 || CLA_STAGE_DENSE)\n"
-                "#define CLA_TOUCHES_WORKSPACE  CLA_ANY_STAGE\n\n"
-                "#endif // CLA_PIPELINE_CONFIG_H\n")
+                "#define CLA_ANY_STAGE    (CLA_STAGE_CONV1_POOL1 || CLA_STAGE_CONV2_POOL2 || CLA_STAGE_DENSE) /**< Any stage on the CLA. */\n"
+                "#define CLA_TOUCHES_WORKSPACE  CLA_ANY_STAGE /**< CLA reads workspace[]. */\n\n"
+                "#endif\n")
 
     def write_feature_tables(self, embedded_dir):
         """Writes embedded_dir/feature_tables.h (MFCC tables + mu/sigma of the
@@ -2529,7 +2849,7 @@ class TrainingThread(QThread):
                     "folder (Prepare_features.py writes it there)")
             with open(cfg_path) as f:
                 fcfg = json.load(f)
-            n_out = fcfg["n_mfcc"] - int(fcfg["drop_c0"])
+            n_out = feature_n_out(fcfg)
             if (fcfg["n_frames"], n_out) != (self.input_h, self.input_w):
                 raise ValueError(
                     f"feature_config.json describes {fcfg['n_frames']}x{n_out} "
@@ -2593,8 +2913,8 @@ class TrainingThread(QThread):
         if tpl is None:
             self.update_signal.emit(
                 f"<span style='color:{C_ERR};'>embedded/: no firmware "
-                f"templates found. Put a {FIRMWARE_DIR}/ checkout beside "
-                f"the app, or point EDGE_AI_FIRMWARE_DIR at one. "
+                f"templates found. Pick the CCS project with <b>CCS "
+                f"project…</b> on the toolbar. "
                 f"main.c / weights.h / definitions.h skipped.</span>")
             return
 
@@ -2607,7 +2927,7 @@ class TrainingThread(QThread):
             # names them that way and hard-codes 2x1 pooling. Everything else
             # in the file is a formula over these, so the preprocessor
             # recomputes CONV*/POOL*/DENSE_LAYER_* sizes on its own.
-            defs = open(os.path.join(tpl, "definitions.h")).read()
+            defs = open(project_file(tpl, "definitions.h")).read()
             defs = patch_c_define(defs, "IMAGE_H", self.input_h)
             defs = patch_c_define(defs, "IMAGE_W", self.input_w)
             defs = patch_c_define(defs, "NUM_FILTERS", best_ch)
@@ -2628,7 +2948,7 @@ class TrainingThread(QThread):
             # IMAGE_H*IMAGE_W from definitions.h. fc_weights here is the
             # "for consistency" copy -- the FC weights the CLA actually reads
             # are main.c's weight[], patched below.
-            wts = open(os.path.join(tpl, "weights.h")).read()
+            wts = open(project_file(tpl, "weights.h")).read()
             for name, q, s in (("conv1_weights", w1q, w1s),
                                 ("conv1_bias", b1q, b1s),
                                 ("conv2_weights", w2q, w2s),
@@ -2637,13 +2957,66 @@ class TrainingThread(QThread):
                                 ("fc_bias", fcb_q, fcb_scale)):
                 wts = patch_c_float_const(wts, f"{name}_scale", s)
                 wts = patch_c_array(wts, f"const int16_t {name}", len(q), q)
+            # ---- test inputs: the seed in weights.h and test_inputs.h ----
+            # input_image[]'s initializer has to have IMAGE_H*IMAGE_W values
+            # -- a template written for another input size would not even
+            # compile -- so it is rewritten with the first test input. That
+            # also makes it what its comment says it is: a real sample of
+            # THIS dataset, in the units main.c feeds the network.
+            in_scale = template_input_scale(defs)
+            samples = getattr(self, "test_inputs", None) or []
+            names = getattr(self, "class_names", None) or [
+                str(i) for i in range(self.num_classes)]
+            if samples:
+                wts = patch_c_array(
+                    wts, "int16_t input_image", "IMAGE_H * IMAGE_W",
+                    quantize_input(samples[0][1], in_scale).reshape(-1))
             with open(f"{embedded_dir}/weights.h", "w") as f:
                 f.write(wts)
+
+            fcfg_path = find_feature_config(self.dataset_path)
+            slice_len = None
+            if fcfg_path:
+                with open(fcfg_path) as f:
+                    slice_len = json.load(f).get("slice_len")
+            # Which test the firmware runs (see "On-board test inputs").
+            g = getattr(self, "golden", None)
+            golden, why = 0, "the dataset holds no raw windows"
+            if g is not None:
+                if not ft_note:
+                    why = "feature_tables.h was not generated for this dataset"
+                elif g["bits"] != GOLDEN_FW_BITS:
+                    why = (f"its raw windows are {g['bits']}-bit, the firmware "
+                           f"expects {GOLDEN_FW_BITS}-bit ADC codes")
+                elif not slice_len or g["adc"].shape[1] != int(slice_len):
+                    why = "its raw windows are not one feature window long"
+                else:
+                    golden = 2
+            if golden == 2:
+                with open(f"{embedded_dir}/golden_vectors.h", "w", encoding="ascii") as f:
+                    f.write(build_golden_vectors_h(
+                        g["adc"], g["labels"], g["src"], names,
+                        os.path.basename(self.dataset_path)))
+            elif bool(slice_len) and has_golden_adc(names, slice_len):
+                golden = 1
+            with open(f"{embedded_dir}/test_inputs.h", "w") as f:
+                f.write(build_test_inputs_h(
+                    samples, names, self.input_h, self.input_w, in_scale,
+                    golden, os.path.basename(self.dataset_path)))
+            self.update_signal.emit(
+                "embedded/: on-board test uses "
+                + (f"{len(g['labels'])} raw ADC windows of this dataset, one per "
+                   f"class, written to golden_vectors.h (whole chain, feature "
+                   f"extraction included)" if golden == 2 else
+                   "the project's golden ADC recordings (whole chain, MFCC "
+                   "included)" if golden == 1 else
+                   f"{len(samples)} validation samples written to "
+                   f"test_inputs.h (network only -- {why})"))
 
             # ---- main.c: the CLA-resident copy of the dense weights --------
             # Only weight[] is data; the MFCC call, ADC/DMA setup, golden
             # vector loop and CLA task trigger are left byte-identical.
-            mc = open(os.path.join(tpl, "main.c")).read()
+            mc = open(project_file(tpl, "main.c")).read()
             mc = patch_c_array(mc, "const int16_t weight", "DENSE_LAYER_WEIGHTS", fcw_q)
             with open(f"{embedded_dir}/main.c", "w") as f:
                 f.write(mc)
@@ -2660,6 +3033,7 @@ class TrainingThread(QThread):
                 "To go back to THIS model later, copy them over again by hand,\n"
                 "then Project > Clean + Build in CCS:\n"
                 "  definitions.h, weights.h, main.c   -- this model's weights/scales\n"
+                "  test_inputs.h                      -- on-board test inputs\n"
                 "  cla_pipeline_config.h              -- CPU/CLA stage split\n"
                 + ("  feature_tables.h                   -- MFCC tables, mu/sigma of\n"
                    f"      {os.path.basename(self.dataset_path)}\n" if ft_note else
@@ -2688,23 +3062,38 @@ class TrainingThread(QThread):
         project = find_ccs_project()
         if project is None:
             self.update_signal.emit(
-                f"<span style='color:{C_WARN};'>No {FIRMWARE_DIR}/ project "
-                f"found to port into (set EDGE_AI_FIRMWARE_DIR to point at "
-                f"one) -- the files are only in {embedded_dir}.</span>")
+                f"<span style='color:{C_WARN};'>No CCS project found to port "
+                f"into -- pick it with <b>CCS project…</b> on the toolbar and "
+                f"export again. The files are only in {embedded_dir}.</span>")
+            return
+        dups = project_duplicates(project, PORTED_FILES)
+        if dups:
+            listing = "; ".join(
+                f"{name}: " + ", ".join(
+                    os.path.relpath(p, project).replace(os.sep, "/")
+                    for p in paths)
+                for name, paths in dups.items())
+            self.update_signal.emit(
+                f"<span style='color:{C_ERR};'><b>Not ported:</b> {project} "
+                f"holds more than one copy of a model file ({listing}). "
+                f"main.c and the kernels would each compile against a "
+                f"different one. Delete the copy the project does not use, "
+                f"then export again. The export itself is complete in "
+                f"{embedded_dir}.</span>")
             return
         try:
             done = port_to_ccs(embedded_dir, project)
             with open(os.path.join(project, PORT_STAMP), "w",
                       encoding="utf-8") as f:
                 f.write(
-                    "Bu klasordeki model dosyalari ADOT tarafindan son "
-                    "export'tan kopyalandi -- her egitimde uzerine yazilir.\n"
-                    f"tarih   : {datetime.datetime.now():%Y-%m-%d %H:%M:%S}\n"
+                    "The model files in this folder were copied by ADOT from "
+                    "the last export; every export overwrites them.\n"
+                    f"date    : {datetime.datetime.now():%Y-%m-%d %H:%M:%S}\n"
                     f"export  : {os.path.dirname(embedded_dir)}\n"
                     f"dataset : {os.path.basename(self.dataset_path)}\n"
-                    f"kanal   : {best_ch}"
-                    + (" (sabit, karsilastirma)" if self.fixed_channels else "")
-                    + f"\ndosyalar: {', '.join(done)}\n")
+                    f"channels: {best_ch}"
+                    + (" (fixed, comparison)" if self.fixed_channels else "")
+                    + f"\nfiles   : {', '.join(done)}\n")
         except OSError as e:
             self.update_signal.emit(
                 f"<span style='color:{C_ERR};'>Porting to {project} failed: "
@@ -2729,6 +3118,10 @@ class TrainingThread(QThread):
                 f"\n<b>[1/4] Loading dataset: {os.path.basename(self.dataset_path)}</b>")
             data_probe = np.load(self.dataset_path, allow_pickle=True)
             has_test = "X_test" in data_probe.files
+            # the dataset validates on its own test set: those files were not
+            # trained on, but the model was selected on them
+            val_is_test = ("val_is_test" in data_probe.files
+                           and bool(data_probe["val_is_test"]))
             stem = os.path.splitext(os.path.basename(self.dataset_path))[0]
             # Folder name says what the model can and can't be trusted for:
             # a dataset with a real held-out X_test produces an "eval" model
@@ -2736,7 +3129,8 @@ class TrainingThread(QThread):
             # without X_test (e.g. full.npz) produces a "deployment" model
             # that has already seen every file, so it must not be presented
             # as tested on unseen data.
-            tag = "eval_heldout_test" if has_test else "deployment_all_data"
+            tag = ("eval_validated_on_test" if has_test and val_is_test else
+                   "eval_heldout_test" if has_test else "deployment_all_data")
             # GUNCELLEME: her export kendi tarih-saat damgali klasorune yazilir
             # -- ayni dataset'i farkli ayarlarla (kanal/CLA plani/quant) tekrar
             # tekrar denerken eski sonuclar USTUNE YAZILMAZ, hepsi export/
@@ -2783,9 +3177,13 @@ class TrainingThread(QThread):
                        if target_met else
                        f"<span style='color:{C_ERR};'>below the target</span>"))
                 best_model, best_ch = m, ch
+                best_robust = s
             else:
                 best_model, best_ch, target_met = None, self.max_channels, False
                 best_seen = -1.0
+                # the worst-case score of the model that ends up exported --
+                # the number the target was compared with
+                best_robust = None
 
                 self.update_signal.emit(
                     f"<br><b>[2/4] Architecture search &mdash; target "
@@ -2810,9 +3208,11 @@ class TrainingThread(QThread):
                             f"<span style='color:{C_OK};'><b>Target met at {ch} channels "
                             f"&mdash; phase 2</b></span>")
                         best_model, best_ch, target_met = m, ch, True
+                        best_robust = s
                         break
                     if ch >= self.max_channels:
                         best_model, best_ch = m, ch
+                        best_robust = s
                         break
                     ch = min(ch + 10, self.max_channels)
 
@@ -2842,6 +3242,7 @@ class TrainingThread(QThread):
                             f"<span style='color:{C_OK};'>{fine} channels also robust "
                             f"({s:.1f}%), continuing to shrink</span>")
                         best_model, best_ch = m, fine
+                        best_robust = s
                         best_seen = max(best_seen, s)
                         self.emit_progress(best=best_seen)
 
@@ -2890,18 +3291,23 @@ class TrainingThread(QThread):
                 self.input_h, self.input_w, self.layers, self.pool_w)
 
             with open(f"{self.out_dir}/model_weights_{sfx}.h", "w") as f:
-                f.write(f"#ifndef MODEL_WEIGHTS_{mac}_H\n"
+                f.write("/**\n"
+                        f" * @file model_weights_{sfx}.h\n"
+                        f" * @brief {mac} weights of the exported model.\n"
+                        " * @note Generated by ADOT; do not edit.\n"
+                        " */\n"
+                        f"#ifndef MODEL_WEIGHTS_{mac}_H\n"
                         f"#define MODEL_WEIGHTS_{mac}_H\n\n#include <stdint.h>\n\n")
-                f.write(f"#define INPUT_H      {self.input_h}\n"
-                        f"#define INPUT_W      {self.input_w}\n"
-                        f"#define NUM_CLASSES  {self.num_classes}\n"
-                        f"#define NUM_LAYERS   {self.layers}\n"
-                        f"#define CHANNELS     {best_ch}\n"
-                        f"#define POOL_W       {1 if self.pool_w else 0}\n"
-                        f"#define FC_IN        {best_ch * h * w}\n\n")
+                f.write(f"#define INPUT_H      {self.input_h} /**< Input frames. */\n"
+                        f"#define INPUT_W      {self.input_w} /**< Features per frame. */\n"
+                        f"#define NUM_CLASSES  {self.num_classes} /**< Output classes. */\n"
+                        f"#define NUM_LAYERS   {self.layers} /**< Conv layers. */\n"
+                        f"#define CHANNELS     {best_ch} /**< Filters per conv layer. */\n"
+                        f"#define POOL_W       {1 if self.pool_w else 0} /**< 1: pool width too. */\n"
+                        f"#define FC_IN        {best_ch * h * w} /**< Dense inputs. */\n\n")
 
-                f.write("// --- feature normalization: (x - mu) / sigma, "
-                        "then clip to [-3,3] ---\n")
+                f.write("/** @brief Feature normalization: (x - mu) / sigma, "
+                        "then clip to [-3, 3]. */\n")
                 write_float_array(f, "feat_mu", data["mu"])
                 write_float_array(f, "feat_sigma", data["sigma"])
 
@@ -2932,11 +3338,48 @@ class TrainingThread(QThread):
 
             # sample inputs for on-device verification (one per class)
             with open(f"{self.out_dir}/test_samples_{sfx}.h", "w") as f:
-                f.write(f"#ifndef TEST_SAMPLES_{mac}_H\n"
+                f.write("/**\n"
+                        f" * @file test_samples_{sfx}.h\n"
+                        " * @brief One correctly classified validation sample per class.\n"
+                        " * @note Generated by ADOT; do not edit.\n"
+                        " */\n"
+                        f"#ifndef TEST_SAMPLES_{mac}_H\n"
                         f"#define TEST_SAMPLES_{mac}_H\n\n#include <stdint.h>\n\n")
                 Xva = torch.tensor(data["X_val"], dtype=torch.float32).unsqueeze(1)
                 yva = data["y_val"]
                 best_model.eval()
+                # test_inputs.h (see build_test_inputs_h): one validation
+                # sample per class, a correctly classified one when there is
+                # one. Kept on self for write_embedded_files().
+                with torch.no_grad():
+                    _pred = torch.argmax(best_model(Xva), dim=1).numpy()
+                self.test_inputs = pick_test_inputs(
+                    data["X_val"], yva, self.num_classes,
+                    lambda i: int(_pred[i]) == int(yva[i]))
+                self.class_names = [str(c) for c in data["classes"]]
+                # Golden windows (datasets prepared from recordings): raw ADC
+                # codes plus the features the firmware must compute from
+                # them. One per class, preferring one the model gets right;
+                # their features then replace the validation samples above,
+                # so test_inputs.h and golden_vectors.h describe the same
+                # windows.
+                self.golden = None
+                try:
+                    g_ref, g_y = data["golden_ref"], data["golden_y"]
+                    with torch.no_grad():
+                        g_pred = torch.argmax(best_model(torch.tensor(
+                            g_ref, dtype=torch.float32).unsqueeze(1)), dim=1).numpy()
+                    picks = pick_golden(g_y, g_pred, self.num_classes)
+                    if picks is not None:
+                        self.golden = {
+                            "adc": np.asarray(data["golden_adc"])[picks],
+                            "labels": [int(g_y[i]) for i in picks],
+                            "src": [str(data["golden_src"][i]) for i in picks],
+                            "bits": int(data["golden_bits"])}
+                        self.test_inputs = [(int(g_y[i]), np.asarray(g_ref[i]))
+                                            for i in picks]
+                except KeyError:
+                    pass                 # a dataset without golden windows
                 seen = set()
                 with torch.no_grad():
                     for idx in range(len(yva)):
@@ -2975,7 +3418,15 @@ class TrainingThread(QThread):
                         f"   [MFCC always on CPU]\n")
                 f.write(f"train slices: {len(tr.dataset)} | val slices: {len(va.dataset)}\n")
                 f.write(f"val acc {acc:.1f}% | val macro-F1 {f1:.1f}%\n\n")
-                if has_test:
+                if has_test and val_is_test:
+                    f.write(
+                        "The files below were NOT trained on, but they WERE the\n"
+                        "validation set: the channel count and the stopping epoch were\n"
+                        "chosen on them. A score on them is a validation score, not an\n"
+                        "independent test -- do not report it as unseen-data accuracy.\n")
+                    for tf in sorted(set(str(s) for s in data["src_test"])):
+                        f.write(f"  {tf}\n")
+                elif has_test:
                     f.write(
                         "This model was trained WITHOUT the files below (true held-out\n"
                         "test set, file-level split) -- safe to use for a genuine\n"
@@ -3000,7 +3451,7 @@ class TrainingThread(QThread):
                 "acc": acc, "f1": f1, "conf": conf,
                 "quant": self.quant_mode, "q_acc": q_acc, "q_f1": q_f1,
                 "metric": self.metric, "target": self.target_val,
-                "target_met": target_met,
+                "target_met": target_met, "robust": best_robust,
                 "fixed": bool(self.fixed_channels),
                 "classes": classes, "cm": cm.tolist(),
                 "out_dir": self.out_dir,
@@ -3105,10 +3556,10 @@ class SetupDialog(QDialog):
             "Debug/dense_layer_cla.map.")
         self._edits["cpu"].setToolTip(
             "SRAM one C28x can reach. The MFCC front end is charged against "
-            "this budget -- its buffers (the raw slice, the log-mel frames and "
-            "the FFT scratch) are the largest single item on the CPU side, "
-            "~85 KB for a 65-frame window, which is why the C28x RAM and not "
-            "the CLA RAM is what a small part runs out of first.")
+            "this budget -- its buffers (the log-mel frames, the FFT buffer "
+            "and its twiddle tables) come to ~16 KB for a 65-frame window. "
+            "The front end no longer keeps a float copy of the raw slice, "
+            "which is what used to make this ~85 KB.")
         self._edits["cla"].setToolTip(
             "CNN_Inference_Edge-AI_with_CLA's linker script (2837xD_FLASH_CLA_lnk_"
             "cpu1.cmd) gives the CLA one combined pool: RAMLS_0_1_2_3_4, length "
@@ -3126,8 +3577,8 @@ class SetupDialog(QDialog):
             "been removed. If a build overflows while this gauge says it fits, "
             "look for another one before doubting the arithmetic.\n\n"
             "A separate 0x800 = 2048-word block (RAMLS5_PROG) holds CLA program "
-            "code and is NOT part of this budget -- that one is nearly full "
-            "(2042/2048).")
+            "code and is NOT part of this budget -- 1294 of 2048 words with "
+            "all three stages on the CLA.")
         lay.addWidget(mem)
 
         # --------------------------------------------------------- timing
@@ -3143,8 +3594,8 @@ class SetupDialog(QDialog):
             "RAM. Charged against the CPU RAM budget, because on a small "
             "part it -- not the network -- is what runs out of room first.\n\n"
             "Empty: this project's MFCC buffers, derived from the window "
-            "(the raw slice, the log-mel frames and the FFT scratch; 80 KB "
-            "for a 65-frame window, against 85 KB in the .map). Type your "
+            "(the log-mel frames, the FFT buffer and its tables; 16 KB for "
+            "a 65-frame window, which is what the .map shows). Type your "
             "own if your front end is not that one.")
         tim.add(self._field("infer", "Inference (ms):",
                             "" if cfg.get("infer_ms") is None
@@ -3320,6 +3771,658 @@ class SetupDialog(QDialog):
         self.accept()
 
 
+# ==========================================
+# DATASET PREPARATION DIALOG
+# ==========================================
+# (key, label in the combo, defaults). window_ms is rounded to what the
+# front end can cut: n_fft + whole hops, or rows x columns for raw input.
+PREP_PRESETS = [
+    ("sound", "Sound  —  MFCC",
+     {"feature": "mfcc", "sr": 16000, "n_fft": 512, "hop": 256,
+      "window": 1056.0}),
+    ("vibration", "Vibration  —  log-spectrum",
+     {"feature": "logspec", "sr": 12000, "n_fft": 256, "hop": 128,
+      "window": 341.3}),
+    ("raw", "Custom  —  raw samples",
+     {"feature": "raw", "sr": 12000, "window": 33.3}),
+]
+# which fields each front end has
+PREP_FIELDS = {"mfcc": ("n_fft", "hop", "n_mels", "n_mfcc"),
+               "logspec": ("n_fft", "hop", "n_bands"),
+               "raw": ("raw_cols",)}
+
+
+class PrepThread(QThread):
+    """Runs adot_dataset.prepare() off the GUI thread."""
+    progress = pyqtSignal(int, int, str)
+    finished_ok = pyqtSignal(dict)
+    failed = pyqtSignal(str)             # "" = cancelled by the user
+
+    def __init__(self, cfg, parent=None):
+        super().__init__(parent)
+        self.cfg = cfg
+        self._cancel = False
+
+    def cancel(self):
+        self._cancel = True
+
+    def _tick(self, done, total, text):
+        self.progress.emit(done, total, text)
+        return not self._cancel
+
+    def run(self):
+        try:
+            self.finished_ok.emit(
+                adot_dataset.prepare(self.cfg, progress=self._tick, log=lambda m: None))
+        except adot_dataset.Cancelled:
+            self.failed.emit("")
+        except adot_dataset.PrepError as e:
+            self.failed.emit(str(e))
+        except Exception as e:
+            self.failed.emit(f"{type(e).__name__}: {e}")
+
+
+class PrepareDialog(QDialog):
+    """Recordings in class folders -> dataset.npz + feature_config.json.
+
+    The window owns no logic of its own: it fills an adot_dataset.PrepConfig
+    and shows what adot_dataset says about it. On success `summary` holds
+    what prepare() returned and the dialog is accepted."""
+
+    def __init__(self, parent=None, state=None):
+        super().__init__(parent)
+        self.setWindowTitle("Prepare a dataset from recordings")
+        self.setModal(True)
+        self.setStyleSheet(parent.styleSheet() if parent else "")
+        self.setMinimumWidth(980)
+        self.summary = None
+        self._edits, self._rows = {}, {}
+        self._thread = None
+        self._scan = None                # (level names, has audio, has tables)
+        self._out_auto = True
+        self._input_sr_auto = True       # follows "sample rate" until typed
+        self._bands_auto = True          # follows the FFT length until typed
+        self._loading = False
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(18, 16, 18, 16)
+        outer.setSpacing(12)
+        cols = QHBoxLayout()
+        cols.setSpacing(14)
+        left, right = QVBoxLayout(), QVBoxLayout()
+        left.setSpacing(12)
+        right.setSpacing(12)
+        cols.addLayout(left, 1)
+        cols.addLayout(right, 1)
+        outer.addLayout(cols, 1)
+
+        # ------------------------------------------------------ recordings
+        rec = Card("Recordings",
+                   "One folder per class. A second folder level (a motor, a "
+                   "load, a recording day) is a group that can be held out "
+                   "as the test set. .wav / .flac, or .npy / .csv holding "
+                   "one signal.")
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        self.root_edit = QLineEdit()
+        self.root_edit.setReadOnly(True)
+        self.root_edit.setPlaceholderText("folder that holds the class folders")
+        browse = QPushButton("Browse…")
+        browse.setCursor(Qt.PointingHandCursor)
+        browse.clicked.connect(self._browse_root)
+        row.addWidget(self.root_edit, 1)
+        row.addWidget(browse)
+        rec.add(row)
+        self.class_combo = QComboBox()
+        self.group_combo = QComboBox()
+        rec.add(self._labelled("Class is named by:", self.class_combo))
+        rec.add(self._labelled("Group is named by:", self.group_combo))
+        rec.add(self._row("classes", "Class order (label 0, 1, …):", "",
+                          "Comma-separated folder names. The order is the label "
+                          "order the firmware reports; put the healthy class first."))
+        self.table = QLabel("Choose a folder.")
+        self.table.setObjectName("Hint")
+        self.table.setTextFormat(Qt.RichText)
+        self.table.setWordWrap(True)
+        self.table.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        rec.add(self.table, 1)
+        left.addWidget(rec, 1)
+
+        # ---------------------------------------------------------- signal
+        sig = Card("Signal and features",
+                   "The signal type picks the front end the firmware will "
+                   "run; every number stays editable.")
+        self.type_combo = QComboBox()
+        for key, label, _ in PREP_PRESETS:
+            self.type_combo.addItem(label, key)
+        sig.add(self._labelled("Signal type:", self.type_combo))
+        sig.add(self._row("sr", "Sample rate (Hz):", "",
+                          "The rate the features are computed at and the rate "
+                          "the board must sample at. Audio files at another "
+                          "rate are resampled."))
+        sig.add(self._row("input_sr", "Rate of the .npy/.csv files (Hz):", "",
+                          "These files carry no sample rate."))
+        sig.add(self._row("full_scale", "Full scale of .npy/.csv:", "",
+                          "The signal value that would drive the ADC to its "
+                          "rail, in the files' own unit (e.g. 8 for +-8 g). "
+                          "Empty: 1.2 times the largest peak in the "
+                          "recordings, rounded up -- type your hardware's "
+                          "value when you have one. Sets the ADC codes of "
+                          "the on-board test windows; a log-spectrum's "
+                          "absolute level follows it."))
+        self._edits["full_scale"].setPlaceholderText("auto — from the recordings' peak")
+        sig.add(self._row("window", "Window (ms):", "",
+                          "Length of one classified window. Rounded to what "
+                          "the front end can cut exactly."))
+        sig.add(self._row("n_fft", "FFT length:", ""))
+        sig.add(self._row("hop", "Hop (samples):", ""))
+        sig.add(self._row("n_mels", "Mel bands:", "40"))
+        sig.add(self._row("n_mfcc", "MFCC coefficients (C0 is dropped):", "13"))
+        sig.add(self._row("n_bands", "Linear bands (= input width):", "24",
+                          "How many equal-width bands the FFT bins are "
+                          "averaged into. Follows the FFT length until you "
+                          "type a number: at least two bins per band, at "
+                          "most 32 bands."))
+        sig.add(self._row("raw_cols", "Columns (= input width):", "20"))
+        self.derived = QLabel()
+        self.derived.setWordWrap(True)
+        self.derived.setStyleSheet(f"color:{C_TEXT}; font-weight:600;")
+        sig.add(self.derived)
+        right.addWidget(sig)
+
+        # ----------------------------------------------------------- split
+        spl = Card("Split",
+                   "Some recordings are held out whole; every other recording "
+                   "is trained on from start to end. Files are split before "
+                   "they are cut, so windows of one recording never land on "
+                   "both sides.")
+        self.test_combo = QComboBox()
+        self.test_combo.setToolTip(
+            "Recordings the network is never trained on. The search is "
+            "scored on them -- which channel count is enough, which epoch "
+            "to keep -- and the accuracy ADOT reports is theirs. Because "
+            "the model is chosen on them, report that figure as accuracy "
+            "on recordings held out of training, not as an independent "
+            "test.")
+        spl.add(self._labelled("Held-out recordings:", self.test_combo))
+        spl.add(self._row("max_files", "Max files per group and class (empty = all):", ""))
+        right.addWidget(spl)
+
+        out = Card("Output")
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        self.out_edit = QLineEdit()
+        self.out_edit.textEdited.connect(self._out_typed)
+        self.out_edit.textChanged.connect(self._changed)
+        out_browse = QPushButton("Browse…")
+        out_browse.setCursor(Qt.PointingHandCursor)
+        out_browse.clicked.connect(self._browse_out)
+        row.addWidget(self.out_edit, 1)
+        row.addWidget(out_browse)
+        out.add(row)
+        hint = QLabel("Writes folds/dataset.npz and feature_config.json there.")
+        hint.setObjectName("Hint")
+        out.add(hint)
+        right.addWidget(out)
+        right.addStretch(1)
+
+        # ----------------------------------------------------------- footer
+        self.error_label = QLabel()
+        self.error_label.setWordWrap(True)
+        self.error_label.setStyleSheet(f"color:{C_ERR}; font-size:11px;")
+        self.error_label.hide()
+        outer.addWidget(self.error_label)
+        self.progress = QProgressBar()
+        self.progress.setTextVisible(False)
+        self.progress.setFixedHeight(6)
+        self.progress.hide()
+        outer.addWidget(self.progress)
+        row = QHBoxLayout()
+        self.status = QLabel()
+        self.status.setObjectName("Hint")
+        row.addWidget(self.status, 1)
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.setCursor(Qt.PointingHandCursor)
+        self.cancel_btn.clicked.connect(self.reject)
+        self.go_btn = QPushButton("Prepare")
+        self.go_btn.setObjectName("Primary")
+        self.go_btn.setFixedHeight(32)
+        self.go_btn.setFixedWidth(120)
+        self.go_btn.setCursor(Qt.PointingHandCursor)
+        self.go_btn.clicked.connect(self._start)
+        row.addWidget(self.cancel_btn)
+        row.addWidget(self.go_btn)
+        outer.addLayout(row)
+
+        self._edits["input_sr"].textEdited.connect(self._input_sr_typed)
+        self._edits["n_bands"].textEdited.connect(self._bands_typed)
+        self._edits["n_fft"].textEdited.connect(self._default_bands)
+        self._edits["sr"].textEdited.connect(self._sr_typed)
+        self.type_combo.currentIndexChanged.connect(self._type_changed)
+        self.class_combo.currentIndexChanged.connect(self._levels_changed)
+        self.group_combo.currentIndexChanged.connect(self._levels_changed)
+        self.test_combo.currentIndexChanged.connect(self._changed)
+        self._apply_preset()
+        if state:
+            self._restore(state)
+        self._changed()
+
+    # --------------------------------------------------------------- widgets
+    def _labelled(self, label, widget):
+        lay = QHBoxLayout()
+        lay.setSpacing(8)
+        lbl = QLabel(label)
+        lbl.setObjectName("FieldLabel")
+        lbl.setMinimumWidth(150)
+        lay.addWidget(lbl)
+        lay.addWidget(widget, 1)
+        return lay
+
+    def _row(self, key, label, value, tip=""):
+        """A labelled field in a widget of its own, so it can be hidden when
+        the chosen front end has no such setting."""
+        w = QWidget()
+        lay = QHBoxLayout(w)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(8)
+        lbl = QLabel(label)
+        lbl.setObjectName("FieldLabel")
+        lbl.setMinimumWidth(230)
+        edit = QLineEdit(value)
+        if tip:
+            edit.setToolTip(tip)
+            lbl.setToolTip(tip)
+        edit.textChanged.connect(self._changed)
+        lay.addWidget(lbl)
+        lay.addWidget(edit, 1)
+        self._edits[key], self._rows[key] = edit, w
+        return w
+
+    def _feature(self):
+        return dict((k, d) for k, _, d in PREP_PRESETS)[self.type_combo.currentData()]["feature"]
+
+    # ---------------------------------------------------------------- preset
+    def _apply_preset(self):
+        d = dict((k, d) for k, _, d in PREP_PRESETS)[self.type_combo.currentData()]
+        self._loading = True
+        for key in ("sr", "n_fft", "hop", "window"):
+            if key in d:
+                self._edits[key].setText(f"{d[key]:g}")
+        if self._input_sr_auto:
+            self._edits["input_sr"].setText(f"{d['sr']:g}")
+        self._default_bands()
+        shown = PREP_FIELDS[d["feature"]]
+        for key in ("n_fft", "hop", "n_mels", "n_mfcc", "n_bands", "raw_cols"):
+            self._rows[key].setVisible(key in shown)
+        self._loading = False
+        self._show_table_fields()
+        self._default_out()
+
+    def _input_sr_typed(self, _text):
+        self._input_sr_auto = False
+
+    def _bands_typed(self, _text):
+        self._bands_auto = False
+
+    def _default_bands(self, *_):
+        """Unless a band count was typed, it is the one that suits the FFT."""
+        if not self._bands_auto:
+            return
+        try:
+            n_fft = int(float(self._edits["n_fft"].text()))
+        except ValueError:
+            return
+        if n_fft >= 4:
+            self._edits["n_bands"].setText(str(adot_dataset.default_bands(n_fft)))
+
+    def _sr_typed(self, text):
+        """Unless told otherwise, .npy/.csv files are at the working rate."""
+        if self._input_sr_auto:
+            self._edits["input_sr"].setText(text)
+
+    def _type_changed(self):
+        self._apply_preset()
+        self._changed()
+
+    def _show_table_fields(self):
+        tables = bool(self._scan and self._scan["tables"])
+        for key in ("input_sr", "full_scale"):
+            self._rows[key].setVisible(tables)
+
+    # ---------------------------------------------------------------- folder
+    def _browse_root(self):
+        d = QFileDialog.getExistingDirectory(
+            self, "Folder that holds the class folders", self.root_edit.text())
+        if d:
+            self._set_root(d)
+
+    def _set_root(self, d, class_level=0, group_level=None, keep_type=False):
+        """Reads the folder once: which names each folder level has and what
+        kind of files are in it."""
+        d = os.path.normpath(d)
+        levels, audio, tables, first_audio = [], 0, 0, None
+        exts = adot_dataset.AUDIO_EXT + adot_dataset.TABLE_EXT
+        try:
+            for base, _dirs, files in os.walk(d):
+                good = [f for f in files if os.path.splitext(f)[1].lower() in exts]
+                if not good:
+                    continue
+                rel = os.path.relpath(base, d)
+                parts = [] if rel == "." else rel.split(os.sep)
+                for i, name in enumerate(parts):
+                    while len(levels) <= i:
+                        levels.append(set())
+                    levels[i].add(name)
+                for f in good:
+                    if os.path.splitext(f)[1].lower() in adot_dataset.AUDIO_EXT:
+                        audio += 1
+                        first_audio = first_audio or os.path.join(base, f)
+                    else:
+                        tables += 1
+        except OSError as e:
+            self._fail(f"Could not read {d}: {e}")
+            return
+        self.root_edit.setText(d)
+        self._scan = {"levels": [sorted(s) for s in levels], "audio": audio,
+                      "tables": tables}
+        note = f"{audio + tables} recording(s)"
+        if first_audio:
+            try:
+                import soundfile
+                info = soundfile.info(first_audio)
+                note += (f"  ·  first audio file: {info.samplerate} Hz, "
+                         f"{info.channels} channel(s)"
+                         + (", mixed to mono" if info.channels > 1 else ""))
+            except Exception:
+                pass
+        self._scan["note"] = note
+
+        self._loading = True
+        if not keep_type:                # audio -> sound, tables -> vibration
+            self.type_combo.setCurrentIndex(0 if audio >= tables else 1)
+        for combo, none in ((self.class_combo, False), (self.group_combo, True)):
+            combo.clear()
+            if none:
+                combo.addItem("(no groups)", None)
+            for i, names in enumerate(self._scan["levels"]):
+                shown = ", ".join(names[:4]) + (" …" if len(names) > 4 else "")
+                combo.addItem(f"folder level {i + 1}:  {shown}", i)
+        if group_level is None and len(self._scan["levels"]) > 1:
+            group_level = 1 if class_level == 0 else 0
+        self.class_combo.setCurrentIndex(max(0, self.class_combo.findData(class_level)))
+        self.group_combo.setCurrentIndex(      # item 0 is "(no groups)"
+            0 if group_level is None else max(0, self.group_combo.findData(group_level)))
+        self._loading = False
+        self._apply_preset()
+        self._levels_changed()
+
+    def _levels_changed(self):
+        """Class or group level picked: relabel the files and redraw the table."""
+        if self._loading or not self._scan:
+            return
+        self._classes, self._groups = [], []
+        cl, gl = self.class_combo.currentData(), self.group_combo.currentData()
+        if cl is None:
+            self.table.setText("No recordings inside folders here.")
+            self._changed()
+            return
+        if gl == cl:
+            self.table.setText("Class and group cannot be the same folder level.")
+            self._changed()
+            return
+        try:
+            cfg = adot_dataset.PrepConfig(root=self.root_edit.text(), class_level=cl,
+                                          group_level=gl)
+            rows, classes, skipped = adot_dataset.discover(cfg)
+        except adot_dataset.PrepError as e:
+            self.table.setText(str(e))
+            self._changed()
+            return
+        counts = adot_dataset.describe(rows, classes)
+        groups = sorted({g for c in counts.values() for g in c})
+        self._classes, self._groups = classes, [g for g in groups if g]
+
+        self._loading = True
+        self._edits["classes"].setText(", ".join(classes))
+        keep = self.test_combo.currentData()
+        self.test_combo.clear()
+        # item data is text ("group:<name>"): findData cannot match tuples
+        self.test_combo.addItem("20% of each class's files, at random", "fraction")
+        for g in self._groups:
+            self.test_combo.addItem(f"hold out group  {g}", "group:" + g)
+        i = self.test_combo.findData(keep) if keep else -1
+        self.test_combo.setCurrentIndex(max(0, i))
+        self._loading = False
+
+        cell = "padding:2px 10px 2px 0;"
+        show = groups[:8]
+        h = (f"<span style='color:{C_MUTED};'>{self._scan['note']}"
+             + (f"  ·  {skipped} outside class folders, ignored" if skipped else "")
+             + "</span><br><table cellspacing='0'><tr>"
+             + f"<td style='{cell}'><b>class</b></td>"
+             + "".join(f"<td style='{cell}' align='right'><b>{g or '(none)'}</b></td>"
+                       for g in show)
+             + (f"<td style='{cell}'>…</td>" if len(groups) > len(show) else "")
+             + f"<td style='{cell}' align='right'><b>files</b></td></tr>")
+        for c in classes[:16]:
+            h += (f"<tr><td style='{cell}'>{c}</td>"
+                  + "".join(f"<td style='{cell}' align='right'>{counts[c].get(g, 0)}</td>"
+                            for g in show)
+                  + ("<td></td>" if len(groups) > len(show) else "")
+                  + f"<td style='{cell}' align='right'>{sum(counts[c].values())}</td></tr>")
+        h += "</table>"
+        if len(classes) > 16:
+            h += f"… and {len(classes) - 16} more classes"
+        self.table.setText(h)
+        self._changed()
+
+    # ---------------------------------------------------------------- output
+    def _default_out(self):
+        root = self.root_edit.text()
+        if self._out_auto and root:
+            self._loading = True
+            self.out_edit.setText(os.path.join(
+                os.path.dirname(root), f"{os.path.basename(root)}_{self._feature()}"))
+            self._loading = False
+
+    def _out_typed(self, _text):
+        self._out_auto = False
+
+    def _browse_out(self):
+        d = QFileDialog.getExistingDirectory(self, "Output folder", self.out_edit.text())
+        if d:
+            self._out_auto = False
+            self.out_edit.setText(os.path.normpath(d))
+
+    # ------------------------------------------------------------------ config
+    def _num(self, key, kind=int, optional=False):
+        text = self._edits[key].text().strip().replace(",", ".")
+        if not text:
+            if optional:
+                return None
+            raise ValueError(f"'{key}' is empty")
+        try:
+            v = kind(float(text)) if kind is int else kind(text)
+        except ValueError:
+            raise ValueError(f"'{text}' is not a number ({key})")
+        if v <= 0:
+            raise ValueError(f"{key} must be positive")
+        return v
+
+    def _config(self):
+        """The dialog as an adot_dataset.PrepConfig. Raises ValueError (which
+        PrepError is) with a sentence for the user."""
+        if not self._scan or not self.root_edit.text():
+            raise ValueError("Choose the folder that holds the class folders.")
+        if not getattr(self, "_classes", None):
+            raise ValueError("No class folders with recordings at this folder level.")
+        feature = self._feature()
+        classes = [c.strip() for c in self._edits["classes"].text().split(",") if c.strip()]
+        if sorted(classes) != sorted(set(classes)):
+            raise ValueError("A class is listed twice in the class order.")
+        unknown = [c for c in classes if c not in self._classes]
+        if unknown:
+            raise ValueError(f"Not a class folder: {', '.join(unknown)}")
+        if len(classes) < 2:
+            raise ValueError("At least two classes are needed.")
+        sr = self._num("sr")
+        ms = self._num("window", float)
+        kw = dict(root=self.root_edit.text(), out_dir=self.out_edit.text().strip(),
+                  feature=feature, classes=classes, sr=sr,
+                  class_level=self.class_combo.currentData(),
+                  group_level=self.group_combo.currentData(),
+                  # the held-out recordings are also what the search is
+                  # scored on; nothing is cut off the training recordings
+                  val_from_test=True,
+                  max_files=self._num("max_files", optional=True))
+        if self._scan["tables"]:
+            kw["input_sr"] = self._num("input_sr")
+            kw["full_scale"] = self._num("full_scale", float, optional=True)
+        if feature == "raw":
+            cols = self._num("raw_cols")
+            kw["raw_cols"] = cols
+            kw["slice_len"] = max(3, int(round(ms * sr / 1000.0 / cols))) * cols
+        else:
+            kw["n_fft"], kw["hop"] = self._num("n_fft"), self._num("hop")
+            kw["slice_len"] = adot_dataset.fit_slice_len(ms, sr, kw["n_fft"], kw["hop"])
+            if feature == "mfcc":
+                kw["n_mels"], kw["n_mfcc"] = self._num("n_mels"), self._num("n_mfcc")
+            else:
+                kw["n_bands"] = self._num("n_bands")
+        test = self.test_combo.currentData() or "fraction"
+        kw["test_groups"] = [test[len("group:"):]] if test.startswith("group:") else None
+        kw["test_fraction"] = 0.2 if test == "fraction" else 0.0
+        return adot_dataset.PrepConfig(**kw).resolved()
+
+    def _changed(self, *_):
+        """Any field edited: show what the settings come to, or what is wrong."""
+        if self._loading or self._thread:
+            return
+        try:
+            cfg = self._config()
+            width = {"mfcc": cfg.n_mfcc - int(cfg.drop_c0), "logspec": cfg.n_bands,
+                     "raw": cfg.raw_cols}[cfg.feature]
+            if width < 5 or cfg.n_frames < 8:
+                raise ValueError(
+                    f"A {cfg.n_frames} x {width} input is too small for two 3x3 "
+                    f"convolutions with pooling; use a longer window or more columns.")
+            self.derived.setText(
+                f"Window: {cfg.slice_len} samples = {1000.0 * cfg.slice_len / cfg.sr:.1f} ms"
+                f"   →   network input {cfg.n_frames} × {width}")
+            if not cfg.out_dir:
+                raise ValueError("Choose an output folder.")
+            self.error_label.hide()
+            self.go_btn.setEnabled(True)
+        except ValueError as e:
+            self.derived.setText("")     # never a size next to an error about another
+            if not self._scan:
+                self.error_label.hide()
+            else:
+                self.error_label.setText(str(e))
+                self.error_label.show()
+            self.go_btn.setEnabled(False)
+
+    def _fail(self, text):
+        self.error_label.setText(text)
+        self.error_label.show()
+
+    # --------------------------------------------------------------------- run
+    def _start(self):
+        try:
+            cfg = self._config()
+        except ValueError as e:
+            self._fail(str(e))
+            return
+        target = os.path.join(cfg.out_dir, "folds", f"{cfg.name}.npz")
+        if os.path.exists(target):
+            if QMessageBox.question(
+                    self, "Replace the dataset?",
+                    f"{target}\nalready exists. Replace it?",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+                return
+        self.error_label.hide()
+        self._set_busy(True)
+        self._thread = PrepThread(cfg, self)
+        self._thread.progress.connect(self._progress)
+        self._thread.finished_ok.connect(self._done)
+        self._thread.failed.connect(self._failed)
+        self._thread.start()
+
+    def _set_busy(self, busy):
+        for w in self.findChildren((QLineEdit, QComboBox)):
+            w.setEnabled(not busy)
+        for w in self.findChildren(QPushButton):
+            if w is not self.cancel_btn:
+                w.setEnabled(not busy)
+        self.progress.setVisible(busy)
+        self.progress.setRange(0, 0)
+        if not busy:
+            self.status.setText("")
+
+    def _progress(self, done, total, text):
+        self.progress.setRange(0, total)
+        self.progress.setValue(done)
+        self.status.setText(f"{done} / {total}   {text}")
+
+    def _done(self, summary):
+        self._thread.wait()
+        self._thread = None
+        self.summary = summary
+        self.accept()
+
+    def _failed(self, text):
+        self._thread.wait()
+        self._thread = None
+        self._set_busy(False)
+        self._changed()
+        if text:
+            self._fail(text)
+
+    def reject(self):
+        """Cancel while it runs stops the run and keeps the window open."""
+        if self._thread:
+            self._thread.cancel()
+            self.status.setText("Stopping…")
+            return
+        super().reject()
+
+    # ------------------------------------------------------------------- state
+    def state(self):
+        """Everything typed, so the window can reopen as it was left."""
+        return {"root": self.root_edit.text(), "type": self.type_combo.currentData(),
+                "class_level": self.class_combo.currentData(),
+                "group_level": self.group_combo.currentData(),
+                "test": self.test_combo.currentData(),
+                "out": self.out_edit.text(), "out_auto": self._out_auto,
+                "input_sr_auto": self._input_sr_auto,
+                "bands_auto": self._bands_auto,
+                "edits": {k: e.text() for k, e in self._edits.items()}}
+
+    def _restore(self, st):
+        i = self.type_combo.findData(st.get("type"))
+        if i >= 0:
+            self._loading = True
+            self.type_combo.setCurrentIndex(i)
+            self._loading = False
+            self._apply_preset()
+        if st.get("root") and os.path.isdir(st["root"]):
+            self._set_root(st["root"], st.get("class_level") or 0,
+                           st.get("group_level"), keep_type=True)
+        self._loading = True
+        for k, text in st.get("edits", {}).items():
+            if k in self._edits:
+                self._edits[k].setText(text)
+        self._out_auto = st.get("out_auto", True)
+        self._input_sr_auto = st.get("input_sr_auto", True)
+        self._bands_auto = st.get("bands_auto", True)
+        if st.get("out"):
+            self.out_edit.setText(st["out"])
+        i = self.test_combo.findData(st.get("test")) if st.get("test") else -1
+        if i >= 0:
+            self.test_combo.setCurrentIndex(i)
+        self._loading = False
+
+
 class EdgeAiGui(QMainWindow):
     """One screen: a toolbar, the device, and an action bar.
 
@@ -3456,6 +4559,16 @@ class EdgeAiGui(QMainWindow):
         self.dataset_btn.setFixedHeight(32)
         self.dataset_btn.clicked.connect(self.browse_dataset)
         lay.addLayout(self._field("Dataset", self.dataset_btn))
+        self.prep_btn = QPushButton("From recordings…")
+        self.prep_btn.setObjectName("Chip")
+        self.prep_btn.setCursor(Qt.PointingHandCursor)
+        self.prep_btn.setFixedHeight(32)
+        self.prep_btn.setToolTip(
+            "Build the dataset here: pick a folder of recordings (one folder "
+            "per class), the signal type and the window length. ADOT cuts the "
+            "recordings, computes the features and loads the result.")
+        self.prep_btn.clicked.connect(self.prepare_dataset)
+        lay.addLayout(self._field("", self.prep_btn))
 
         self.quant_combo = QComboBox()
         self.quant_combo.addItems(["FLOAT32", "INT16", "INT8"])
@@ -3550,6 +4663,16 @@ class EdgeAiGui(QMainWindow):
                                   "Flash / CPU RAM / CLA RAM budgets")
         self.setup_btn.clicked.connect(self.open_setup)
         lay.addLayout(self._field("Setup", self.setup_btn))
+
+        # Where exports are ported. A release may run on any machine with the
+        # project anywhere, so it is picked here once and kept in settings.
+        self.ccs_btn = QPushButton("CCS project…")
+        self.ccs_btn.setCursor(Qt.PointingHandCursor)
+        self.ccs_btn.setFixedHeight(32)
+        self.ccs_btn.setMaximumWidth(180)
+        self.ccs_btn.clicked.connect(self.choose_ccs_project)
+        lay.addLayout(self._field("Firmware", self.ccs_btn))
+        self._show_ccs_project()
 
         lay.addStretch()
         self.status_pill = QLabel()
@@ -3872,12 +4995,93 @@ class EdgeAiGui(QMainWindow):
         else:
             self.log(f"<span style='color:{C_WARN};'>No export folder yet.</span>")
 
+    # -------------------------------------------------------- ccs project
+    def _show_ccs_project(self):
+        """Button text = the project exports go to, tooltip = its full path."""
+        project = find_ccs_project()
+        if project:
+            self.ccs_btn.setText(self.ccs_btn.fontMetrics().elidedText(
+                os.path.basename(project) or project, Qt.ElideMiddle, 150))
+            self.ccs_btn.setToolTip(
+                f"Exports are ported into:\n{project}\n\nClick to pick "
+                f"another CCS project folder.")
+        else:
+            self.ccs_btn.setText("CCS project…")
+            self.ccs_btn.setToolTip(
+                "No CCS project found: exports stay in export/ only.\n\n"
+                "Click to pick the project folder (the one holding main.c). "
+                "The choice is remembered.")
+
+    def choose_ccs_project(self):
+        start = find_ccs_project() or os.path.expanduser("~")
+        d = QFileDialog.getExistingDirectory(self, "CCS project folder", start)
+        if not d:
+            return
+        project = resolve_ccs_project(d)
+        if project is None:
+            QMessageBox.warning(
+                self, "ADOT",
+                f"{d}\n\nis not a CCS project ADOT can port into: it needs "
+                f"definitions.h, weights.h and main.c (in the folder or in "
+                f"application/include, application/source).")
+            return
+        try:
+            save_settings(ccs_project=project)
+        except OSError as e:
+            QMessageBox.warning(self, "ADOT",
+                                f"The choice could not be saved: {e}")
+            return
+        self._show_ccs_project()
+        self.log(f"<span style='color:{C_OK};'>CCS project: {project}</span>")
+
     # ------------------------------------------------------------ dataset
     def browse_dataset(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "Select training dataset", "", "NumPy archive (*.npz);;All files (*)")
-        if not path:
+        if path:
+            self.load_dataset(path)
+
+    def prepare_dataset(self):
+        """Recordings -> dataset, in a dialog; the result is loaded like a
+        file picked with 'Choose dataset'."""
+        if adot_dataset is None:
+            self.log(f"<span style='color:{C_ERR};'>Dataset preparation is not "
+                     f"available: adot_dataset.py could not be loaded "
+                     f"({ADOT_DATASET_ERROR}). It belongs next to this program."
+                     f"</span>")
             return
+        dlg = PrepareDialog(self, getattr(self, "_prep_state", None))
+        ok = dlg.exec_() == QDialog.Accepted and dlg.summary
+        self._prep_state = dlg.state()
+        if not ok:
+            return
+        s = dlg.summary
+        f = s["files"]
+        self.log(
+            f"<b>Prepared from recordings:</b> {s['split']}<br>"
+            + "<br>".join(
+                (f"&nbsp;&nbsp;{c}: train {n['train']} | held out {n['test']}"
+                 if s.get("held_out_scoring") else
+                 f"&nbsp;&nbsp;{c}: train {n['train']} | val {n['val']} | test {n['test']}")
+                for c, n in s["counts"].items())
+            + f"<br>window {s['window_ms']:.1f} ms &rarr; input "
+              f"{s['input_h']}x{s['input_w']}"
+            + (f"<br><span style='color:{C_WARN};'>{f['too_short']} recording(s) "
+               f"shorter than what one window needs were skipped.</span>"
+               if f["too_short"] else "")
+            + (f"<br>full scale {s['full_scale']:g}, chosen from the largest peak "
+               f"in the recordings ({s['peak']:.4g})"
+               if s.get("peak") is not None else "")
+            + (f"<br>{s['golden_windows']} raw ADC windows kept for the on-board "
+               f"test (whole chain, from the ADC code to the class)"
+               if s.get("golden_windows") else "")
+            + "<br>Nearest-class-mean check (a sanity check of the labels, not a "
+              "result): "
+            + ", ".join(f"{k} {v:.0f}%" for k, v in s["nearest_mean_pct"].items()
+                        if not (s.get("held_out_scoring") and k == "val")))
+        self.load_dataset(s["dataset"])
+
+    def load_dataset(self, path):
         try:
             d = np.load(path, allow_pickle=True)
             n, h, w = d["X_train"].shape
@@ -3885,6 +5089,10 @@ class EdgeAiGui(QMainWindow):
             self.dataset_path = path
             self.cfg["input_h"], self.cfg["input_w"] = h, w
             self.cfg["classes"] = len(classes)
+            # datasets prepared here are scored on whole held-out recordings;
+            # older ones on the tail of every training recording
+            self.held_out_scoring = ("val_is_test" in d.files
+                                     and bool(d["val_is_test"]))
             self.load_feature_cfg(path)
             self.dataset_btn.setText(os.path.basename(path))
             self.dataset_btn.setToolTip(
@@ -3892,9 +5100,13 @@ class EdgeAiGui(QMainWindow):
                 f"{len(classes)} classes: {', '.join(classes)}")
             self.log(
                 f"<b>Dataset:</b> {os.path.basename(path)}<br>"
-                f"train {n} | val {len(d['y_val'])} | input {h}x{w} | classes {classes}<br>"
+                f"train {n} | {'held out' if self.held_out_scoring else 'val'} "
+                f"{len(d['y_val'])} | input {h}x{w} | classes {classes}<br>"
                 + ("No X_test &mdash; final-model set (accuracy estimate comes from the folds)"
                    if "X_test" not in d.files else
+                   "the search is scored on the held-out recordings (never trained "
+                   "on); the accuracy reported is theirs"
+                   if self.held_out_scoring else
                    "X_test present but <b>will not be used</b>; selection uses X_val"))
             self.refresh()
         except Exception as e:
@@ -3980,13 +5192,36 @@ class EdgeAiGui(QMainWindow):
             plan = feature_plan(self.cfg["input_h"], self.cfg["input_w"],
                                 self.feature_cfg)
             self.log(f"<b>Features:</b> {os.path.basename(p)} &mdash; "
-                     f"{plan['n_fft']}-point FFT, hop {plan['hop']}, "
-                     f"{plan['n_mels']} mel bands, {plan['n_frames']} frames "
-                     f"= {plan['window_ms']:.0f} ms window")
+                     f"{front_end_text(plan)}")
+            self._pooling_advice(plan["feature"])
         except Exception as e:
             self.log(f"<span style='color:{C_WARN};'>feature_config.json "
                      f"could not be read ({e}); the MFCC estimate falls back "
                      f"to assumed parameters.</span>")
+
+    def feature_label(self):
+        """What the input matrix holds, for captions."""
+        kind = feature_kind(self.feature_cfg) if self.feature_cfg else "mfcc"
+        return FEATURE_LABELS.get(kind, kind)
+
+    def _pooling_advice(self, kind):
+        """Whether pooling across the columns makes sense depends on what the
+        columns are, which only the dataset's feature type says."""
+        if kind == "mfcc" and self.cfg["pool_w"]:
+            self.log(
+                f"<span style='color:{C_WARN};'>2D pooling is on, but this "
+                f"dataset's columns are MFCC coefficients: neighbouring "
+                f"coefficients are not neighbours in any physical sense, so "
+                f"taking the larger of two discards information. Turn it off "
+                f"in Setup unless you are comparing on purpose.</span>")
+        elif kind != "mfcc" and not self.cfg["pool_w"]:
+            what = ("frequency bands" if kind == "logspec" else "consecutive samples")
+            self.log(
+                f"<span style='color:{C_FAINT};'>This dataset's columns are "
+                f"{what}, so pooling across them is meaningful: '2D pooling' "
+                f"in Setup roughly halves the conv2 and dense work. The "
+                f"firmware pools 2x1 only, so a 2D-pooled model can be "
+                f"trained and compared here but not exported yet.</span>")
 
     def open_setup(self):
         dlg = SetupDialog(self.cfg, self)
@@ -4004,17 +5239,34 @@ class EdgeAiGui(QMainWindow):
         """The diagram is the CLA plan. Stage ids 0..n-1 are the fused
         conv+pool stages and DENSE_ID is the FC stage; `to_cla` is the
         domain the user picked, not a flip, so re-picking the current domain
-        is a no-op rather than a surprise."""
+        is a no-op rather than a surprise.
+
+        Only plans in which the CLA stages are the END of the chain are
+        allowed (see is_tail_plan): any other split puts a stage on the
+        slower core and buys no overlap. So a stage never moves alone when
+        that would break the rule -- the stages that have to follow it are
+        moved with it, and the log says which."""
+        n = len(self.cla_plan["stages"])
         if sid == self.DENSE_ID:
-            if self.cla_plan["dense"] == to_cla:
-                return
-            self.cla_plan["dense"] = to_cla
-        elif 0 <= sid < len(self.cla_plan["stages"]):
-            if self.cla_plan["stages"][sid] == to_cla:
-                return
-            self.cla_plan["stages"][sid] = to_cla
+            index = n
+        elif 0 <= sid < n:
+            index = sid
         else:
             return
+        flags = list(self.cla_plan["stages"]) + [self.cla_plan["dense"]]
+        if flags[index] == bool(to_cla):
+            return
+        flags, moved = assign_keeping_tail(flags, index, to_cla)
+        self.cla_plan["stages"] = flags[:n]
+        self.cla_plan["dense"] = flags[n]
+        if moved:
+            names = ", ".join("S%d" % (i + 1) for i in moved)
+            where = "CLA" if to_cla else "C28x"
+            self.log(
+                f"<span style='color:{C_WARN};'>{names} moved to the {where} "
+                f"as well: the CLA stages have to be the end of the chain. "
+                f"A C28x stage after a CLA stage would wait for the CLA, so "
+                f"that split overlaps nothing.</span>")
         self.refresh()
 
     # ------------------------------------------------------------- memory
@@ -4056,13 +5308,13 @@ class EdgeAiGui(QMainWindow):
           weights.h/main.c), so moving a stage to the CPU frees CLA RAM.
         * workspace[] and fResult[] need to be CLA-visible as soon as ANY
           stage runs there.
-        * `feature_ram` is the MFCC front end's own working set (the raw
-          slice, the log-mel frames, the FFT scratch). It is not part of the
-          model, but it is the largest thing on the C28x side -- 85 KB,
-          measured as 0xa6c0 words in RAMGS_TOTAL_CNN, against the 164 KB one
-          C28x reaches on this part (the device holds 204 KB in total) --
-          and leaving it out is what made the CPU RAM gauge read zero in
-          every configuration. It is charged to the CPU because the C28x is
+        * `feature_ram` is the MFCC front end's own working set (the
+          log-mel frames, the FFT buffer and its tables). It is not part of
+          the model, but it is still the largest thing on the C28x side --
+          16 KB, 8389 words of mfcc_extract.obj in the .map, against the
+          164 KB one C28x reaches on this part (the device holds 204 KB in
+          total) -- and leaving it out is what made the CPU RAM gauge read
+          zero in every configuration. It is charged to the CPU because the C28x is
           what runs mfcc_extract().
         """
         ds = self.dtype_size(mode)
@@ -4206,11 +5458,11 @@ class EdgeAiGui(QMainWindow):
             self.canvas.clear(
                 f"{self.canvas.device} cannot hold the feature front end\n\n"
                 f"The feature front end's buffers alone are "
-                f"{self.feature_ram / 1024:.0f} KB (raw slice + log-mel frames "
-                f"+ FFT scratch) against a {c['cpu_kb']:.0f} KB CPU RAM "
+                f"{self.feature_ram / 1024:.0f} KB (log-mel frames + FFT "
+                f"buffer and tables) against a {c['cpu_kb']:.0f} KB CPU RAM "
                 f"budget.\nPick a larger part, shorten the window, or raise "
                 f"the budget in Setup.")
-            self._set_status("no room for MFCC", C_ERR)
+            self._set_status("no room for features", C_ERR)
             self.train_btn.setEnabled(False)
             self.max_ch = None
             self._last_footprint = None
@@ -4277,7 +5529,9 @@ class EdgeAiGui(QMainWindow):
         # input_image[] from the MFCC -- so it is not movable. Where those
         # words are STORED is a separate question: the buffer sits in CLA RAM
         # (weights.h's conditional DATA_SECTION), which the tooltip reports.
-        place({"order": 1, "caption": "INPUT", "sub": "MFCC feature matrix",
+        place({"order": 1, "caption": "INPUT",
+               "sub": ("raw samples, folded" if self.feature_label() == "raw samples"
+                       else f"{self.feature_label()} feature matrix"),
                "shape": f"{self.input_h} × {self.input_w}",
                "flash_kb": 0.0,
                # The front end's working buffers, and ONLY those. The
@@ -4443,7 +5697,7 @@ class EdgeAiGui(QMainWindow):
             bits.append(f"{st['channels']} ch")
         if st.get("seed"):
             bits.append(f"seed {st['seed']}/{st.get('seeds', N_SEEDS)}")
-        for key, lbl in (("acc", "acc"), ("f1", "F1"), ("best", "best")):
+        for key, lbl in (("acc", "acc"), ("f1", "F1"), ("best", "worst case")):
             if st.get(key) is not None:
                 bits.append(f"{lbl} {st[key]:.1f}%")
         self.run_detail.setText("   ·   ".join(bits))
@@ -4468,8 +5722,14 @@ class EdgeAiGui(QMainWindow):
             f"{self.elapsed_label.text()} elapsed")
 
         self.r_channels.set_value(s["channels"], note="conv width")
-        self.r_f1.set_value(f"{s['f1']:.1f}%", note="macro average")
-        self.r_acc.set_value(f"{s['acc']:.1f}%", note="validation split")
+        held = getattr(self, "held_out_scoring", False)
+        self.r_acc.cap.setText("HELD-OUT ACCURACY" if held else "VAL ACCURACY")
+        self.r_f1.set_value(f"{s['f1']:.1f}%",
+                            note=("exported model, held-out recordings" if held else
+                                  "exported model, clean validation"))
+        self.r_acc.set_value(f"{s['acc']:.1f}%",
+                             note="recordings held out of training" if held else
+                                  "validation split")
         if s.get("q_f1") is None:
             self.r_quant.set_value("n/a", note="FLOAT32 export", color=C_MUTED)
         else:
@@ -4477,10 +5737,22 @@ class EdgeAiGui(QMainWindow):
             self.r_quant.set_value(f"{s['q_f1']:.1f}%",
                                    note=f"macro-F1 {d:+.1f} pts",
                                    color=C_OK if abs(d) < 1.0 else C_WARN)
+        # The target is compared with the WORST case (every seed, clean and
+        # perturbed validation), not with the clean score in the tile next
+        # door -- so that is the number shown beside the verdict.
+        rob = s.get("robust")
         self.r_target.set_value(
             "met" if met else "missed",
-            note=f"{s['metric']} ≥ {s['target']:.0f}%",
+            note=(f"{s['metric']} ≥ {s['target']:g}%" if rob is None else
+                  f"worst case {rob:.1f}% {'≥' if met else '<'} {s['target']:g}%"),
             color=C_OK if met else C_ERR)
+        self.r_target.setToolTip(
+            f"The target is {s['metric']} ≥ {s['target']:g}% in the worst case: "
+            f"{N_SEEDS} trainings from different seeds, each scored on the clean "
+            f"validation set and on {PERTURB_TRIALS} perturbed copies of it "
+            f"(gain, tilt, noise); the lowest of those scores is what has to "
+            f"reach the target. The Macro-F1 tile shows the exported model on "
+            f"the clean validation set only.")
         port = self.target_mismatch()
         self.r_deploy.set_value(
             "yes" if not why else "no",
@@ -4587,8 +5859,7 @@ class EdgeAiGui(QMainWindow):
             p = t["plan"]
             rows.append((
                 "Feature front end",
-                f"{p['n_fft']}-point FFT, hop {p['hop']}, {p['n_mels']} mel "
-                f"bands, {p['n_frames']} frames = {p['window_ms']:.0f} ms window"
+                front_end_text(p)
                 + ("  (assumed — no feature_config.json)" if p["assumed"] else "")))
             rows.append((
                 "Frame budget",
@@ -4846,36 +6117,33 @@ class EdgeAiGui(QMainWindow):
 
     def _timing_note(self):
         """The frame budget in the form cla_pipeline_config.h carries it:
-        Turkish, like the rest of that header's comments, and explicit that
-        these are modelled cycles, not a measurement off the board."""
+        short English lines, explicit that these are modelled cycles, not a
+        measurement off the board."""
         t = self.timing
         if not t:
             return []
         dev = device_by_key(self.cfg.get("device"))
         lines = [
-            f"Hedef: {dev['name'] if dev else 'ozel'}  "
+            f"Target: {dev['name'] if dev else 'custom'} "
             f"(C28x {self.cfg.get('cpu_mhz', 200):g} MHz, "
             f"CLA {self.cfg.get('cla_mhz', 200):g} MHz)",
-            f"Ozellik : {t['fe_ms']:.2f} ms "
-            f"({'OLCULEN' if t['measured'] else 'tahmin'})",
-            f"MAC basi {t['mac_cost']['cla']:.0f} cevrim (CLA) / "
-            f"{t['mac_cost']['cpu']:.0f} (C28x)"
-            + f" -- model, fit disi tutulan olcumlerde "
-              f"%{VALIDATION_BAND[0]:+.0f} .. %{VALIDATION_BAND[1]:+.0f} "
-              f"sapiyor (-O0 derleme)"
-            + (" -- olculen inference suresinden" if t["infer_measured"]
-               else " -- model varsayimi"),
+            f"Features: {t['fe_ms']:.2f} ms "
+            f"({'measured' if t['measured'] else 'estimated'})",
+            f"Cycles/MAC: {t['mac_cost']['cla']:.0f} CLA, "
+            f"{t['mac_cost']['cpu']:.0f} C28x"
+            + (" (from measured inference)" if t["infer_measured"]
+               else " (model)")
+            + f", held-out error {VALIDATION_BAND[0]:+.1f}..{VALIDATION_BAND[1]:+.1f}% (-O0)",
         ]
         for i, s in enumerate(t["stages"]):
             lines.append(
-                f"S{i + 1}   : {s['ms']:.3f} ms  "
-                f"({'CLA' if s['on_cla'] else 'CPU'}, {s['macs']:,} MAC, "
-                f"{s['cycles'] / 1000:.0f} kcevrim) -- diger tarafta "
-                f"{s['alt_ms']:.3f} ms")
+                f"S{i + 1}: {s['ms']:.3f} ms on "
+                f"{'CLA' if s['on_cla'] else 'CPU'}, {s['macs']:,} MAC "
+                f"(other side {s['alt_ms']:.3f} ms)")
         lines.append(
-            f"Gecikme {t['latency_ms']:.2f} ms, pencere basi "
+            f"Latency {t['latency_ms']:.2f} ms, period "
             f"{t['period_ms']:.2f} ms"
-            + (f" (CLA {t['overlap_ms']:.3f} ms'i ortuyor)"
+            + (f" (CLA overlaps {t['overlap_ms']:.3f} ms)"
                if t["overlap_ms"] > 0 else ""))
         lines.append(timing_advice(t)[1])
         return lines
@@ -4890,9 +6158,9 @@ class EdgeAiGui(QMainWindow):
         thread already holds its own copy of the plan, so letting the toolbar
         or the diagram change would only make the screen lie about the run."""
         self.canvas.locked = locked
-        for w in (self.dataset_btn, self.quant_combo, self.metric_combo,
+        for w in (self.dataset_btn, self.prep_btn, self.quant_combo, self.metric_combo,
                   self.target_edit, self.timing_check, self.setup_btn,
-                  self.fixed_check):
+                  self.fixed_check, self.ccs_btn):
             w.setEnabled(not locked)
         self.fe_edit.setEnabled(not locked and self.timing_check.isChecked())
         self.fixed_edit.setEnabled(not locked and self.fixed_check.isChecked())
