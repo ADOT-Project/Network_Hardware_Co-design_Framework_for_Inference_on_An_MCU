@@ -1,47 +1,20 @@
-data/MNIST/raw/t10k-images-idx3-ubyte
-data/MNIST/raw/t10k-images-idx3-ubyte.gz
-data/MNIST/raw/t10k-labels-idx1-ubyte
-data/MNIST/raw/t10k-labels-idx1-ubyte.gz
-data/MNIST/raw/train-images-idx3-ubyte
-data/MNIST/raw/train-images-idx3-ubyte.gz
-data/MNIST/raw/train-labels-idx1-ubyte
-data/MNIST/raw/train-labels-idx1-ubyte.gz
-export/edge_cnn_17ch.pth
-export/edge_cnn_int16_10ch.pth
-export/edge_cnn_int16_25ch.pth
-export/edge_cnn_int16_27ch.pth
-export/edge_cnn_int16_32ch.pth
-export/edge_cnn_int16_36ch.pth
-export/edge_cnn_int16_8ch.pth
-export/edge_cnn_int8_11ch.pth
-export/edge_cnn_int8_16ch.pth
-export/edge_cnn_int8_20ch.pth
-export/edge_cnn_int8_29ch.pth
-export/edge_cnn_int8_38ch.pth
-export/edge_cnn_int8_47ch.pth
-export/edge_cnn_int8_4ch.pth
-export/edge_cnn_int8_9ch.pth
-export/model_weights.h
-export/model_weights_int16.h
-export/model_weights_int8.h
-export/test_samples.h
-export/test_samples_int16.h
-export/test_samples_int8.h
+# ==========================================================================
+# Whitelist: the repo keeps only what the app needs to run.
+# Everything else in this folder (datasets, export/, packaging and portable
+# builds, tests, firmware experiments, snapshots) stays local; builds are
+# published as GitHub releases.
+# ==========================================================================
+/*
 
-# --- build artifacts (packaging/build.ps1) ---
-build/
-build_out/
-dist/
-*.pyc
+# --- the app ---
+!/.gitignore
+!/.gitmodules
+!/README.md
+!/ADOT_Tool.py
+# imported by the app: dataset preparation
+!/adot_dataset.py
+# submodule: the firmware the export patches
+!/CNN_Inference_Edge-AI_with_CLA
+
 __pycache__/
-build_out_log.txt
-inno_log.txt
-
-# --- training output: every run writes its own timestamped folder ---
-export/
-
-# --- portable runtime (packaging/build_portable.ps1 rebuilds it) ---
-portable/
-
-# --- local firmware snapshots taken before overwriting the project ---
-firmware_backups/
+*.pyc
