@@ -10,6 +10,7 @@
 !/.gitignore
 !/.gitmodules
 !/README.md
+!/LICENSE
 !/ADOT_Tool.py
 # imported by the app: dataset preparation
 !/adot_dataset.py
