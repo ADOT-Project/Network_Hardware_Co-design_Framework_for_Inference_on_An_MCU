@@ -88,6 +88,12 @@ from PyQt5.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog,
 
 # Dataset preparation (recordings in class folders -> dataset.npz) lives in its
 # own file so that it runs without this window, from a terminal or a test.
+# The installed build runs on the embeddable CPython, whose ._pth file means
+# the script's own folder is NOT put on sys.path -- without this line the
+# import fails there, and only there.
+_here = os.path.dirname(os.path.abspath(__file__))
+if _here not in sys.path:
+    sys.path.insert(0, _here)
 try:
     import adot_dataset
     ADOT_DATASET_ERROR = ""
