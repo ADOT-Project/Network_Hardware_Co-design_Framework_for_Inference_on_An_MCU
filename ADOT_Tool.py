@@ -3286,7 +3286,7 @@ class TrainingThread(QThread):
                     f"(delta {delta:+.1f} pts)</span>")
 
             # ---- test set: scored once, after every choice above is made ----
-            test_lines = []
+            test_lines, test_sum = [], None
             if has_test and not val_is_test:
                 te = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(
                     torch.tensor(data["X_test"], dtype=torch.float32).unsqueeze(1),
@@ -3304,6 +3304,8 @@ class TrainingThread(QThread):
                 # A check only -- nothing is changed after it.
                 t_score = self.score(t_acc, t_conf, t_f1)
                 verdict = "achieved" if t_score >= self.target_val else "missed"
+                test_sum = {"model": name, "acc": t_acc, "f1": t_f1, "conf": t_conf,
+                            "score": t_score, "met": verdict == "achieved"}
                 test_lines.append(
                     f"target ({self.metric} >= {self.target_val:g}%) on the test "
                     f"set: {verdict} ({t_score:.1f}%)")
@@ -3489,6 +3491,7 @@ class TrainingThread(QThread):
                 "quant": self.quant_mode, "q_acc": q_acc, "q_f1": q_f1,
                 "metric": self.metric, "target": self.target_val,
                 "target_met": target_met, "robust": best_robust,
+                "test": test_sum,
                 "fixed": bool(self.fixed_channels),
                 "classes": classes, "cm": cm.tolist(),
                 "out_dir": self.out_dir,
@@ -4817,12 +4820,13 @@ class EdgeAiGui(QMainWindow):
         self.r_f1 = StatTile("macro-F1", "--")
         self.r_acc = StatTile("val accuracy", "--")
         self.r_quant = StatTile("after quantization", "--")
-        self.r_target = StatTile("target", "--")
+        self.r_target = StatTile("target · validation", "--")
+        self.r_test = StatTile("target · test", "--")
         self.r_deploy = StatTile("deployable", "--")
         tiles = QHBoxLayout()
         tiles.setSpacing(10)
         for t in (self.r_channels, self.r_f1, self.r_acc, self.r_quant,
-                  self.r_target, self.r_deploy):
+                  self.r_target, self.r_test, self.r_deploy):
             tiles.addWidget(t, 1)
         outer.addLayout(tiles)
 
@@ -5831,6 +5835,26 @@ class EdgeAiGui(QMainWindow):
             f"(gain, tilt, noise); the lowest of those scores is what has to "
             f"reach the target. The Macro-F1 tile shows the exported model on "
             f"the clean validation set only.")
+        # The test set takes part in no choice: one clean pass of the model
+        # the board runs, after the search is over.
+        t = s.get("test")
+        if t is None:
+            self.r_test.set_value(
+                "n/a", note=("validation is the held-out set" if held else
+                             "no separate test set"), color=C_MUTED)
+            self.r_test.setToolTip(
+                "No independent test: prepare the dataset with a validation "
+                "other than the held-out recordings to get one.")
+        else:
+            self.r_test.set_value(
+                "achieved" if t["met"] else "missed",
+                note=f"{s['metric']} {t['score']:.1f}% "
+                     f"{'≥' if t['met'] else '<'} {s['target']:g}% ({t['model']})",
+                color=C_OK if t["met"] else C_ERR)
+            self.r_test.setToolTip(
+                f"{t['model']} model on the test set, once, after every choice "
+                f"was made: acc {t['acc']:.1f}%, macro-F1 {t['f1']:.1f}%, "
+                f"confident acc {t['conf']:.1f}%. Nothing is changed on it.")
         port = self.target_mismatch()
         self.r_deploy.set_value(
             "yes" if not why else "no",
