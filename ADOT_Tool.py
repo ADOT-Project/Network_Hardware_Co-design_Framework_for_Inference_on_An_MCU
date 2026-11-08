@@ -3285,6 +3285,34 @@ class TrainingThread(QThread):
                     f"acc {qa:.1f}% | macro-F1 {qf1:.1f}% "
                     f"(delta {delta:+.1f} pts)</span>")
 
+            # ---- test set: scored once, after every choice above is made ----
+            test_lines = []
+            if has_test and not val_is_test:
+                te = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(
+                    torch.tensor(data["X_test"], dtype=torch.float32).unsqueeze(1),
+                    torch.tensor(data["y_test"], dtype=torch.long)),
+                    batch_size=512, shuffle=False)
+                models = [("FLOAT32", best_model)]
+                if self.quant_mode != "FLOAT32":
+                    models.append((self.quant_mode, qm))
+                for name, m in models:
+                    t_acc, t_conf, t_f1, _, _ = self.evaluate(m, te)
+                    test_lines.append(
+                        f"test ({name}): acc {t_acc:.1f}% | macro-F1 {t_f1:.1f}% | "
+                        f"confident acc {t_conf:.1f}% (softmax >= {self.target_val:g}%)")
+                # judged on the last model listed: the one the board runs.
+                # A check only -- nothing is changed after it.
+                t_score = self.score(t_acc, t_conf, t_f1)
+                verdict = "achieved" if t_score >= self.target_val else "missed"
+                test_lines.append(
+                    f"target ({self.metric} >= {self.target_val:g}%) on the test "
+                    f"set: {verdict} ({t_score:.1f}%)")
+                col = C_OK if verdict == "achieved" else C_ERR
+                self.update_signal.emit(
+                    "<b>Test set</b> (never used for a choice):<br>"
+                    + "<br>".join(test_lines[:-1])
+                    + f"<br><span style='color:{col};'><b>{test_lines[-1]}</b></span>")
+
             # -------------------------------------------------- write files -
             torch.save(best_model.state_dict(),
                        f"{self.out_dir}/edge_cnn_{self.quant_mode.lower()}_{best_ch}ch.pth")
@@ -3423,7 +3451,10 @@ class TrainingThread(QThread):
                         f"{', '.join(cla_on) if cla_on else '(none -- all on CPU)'}"
                         f"   [MFCC always on CPU]\n")
                 f.write(f"train slices: {len(tr.dataset)} | val slices: {len(va.dataset)}\n")
-                f.write(f"val acc {acc:.1f}% | val macro-F1 {f1:.1f}%\n\n")
+                f.write(f"val acc {acc:.1f}% | val macro-F1 {f1:.1f}%\n")
+                for line in test_lines:
+                    f.write(line + "\n")
+                f.write("\n")
                 if has_test and val_is_test:
                     f.write(
                         "The files below were NOT trained on, but they WERE the\n"
@@ -3938,19 +3969,25 @@ class PrepareDialog(QDialog):
 
         # ----------------------------------------------------------- split
         spl = Card("Split",
-                   "Some recordings are held out whole; every other recording "
-                   "is trained on from start to end. Files are split before "
-                   "they are cut, so windows of one recording never land on "
-                   "both sides.")
+                   "Some recordings are held out whole as the test set. Files "
+                   "are split before they are cut, so windows of one recording "
+                   "never land on both sides.")
         self.test_combo = QComboBox()
         self.test_combo.setToolTip(
-            "Recordings the network is never trained on. The search is "
-            "scored on them -- which channel count is enough, which epoch "
-            "to keep -- and the accuracy ADOT reports is theirs. Because "
-            "the model is chosen on them, report that figure as accuracy "
-            "on recordings held out of training, not as an independent "
-            "test.")
+            "Recordings the network is never trained on. Unless they are "
+            "also the validation set, no choice is made on them, and their "
+            "score is an independent test.")
         spl.add(self._labelled("Held-out recordings:", self.test_combo))
+        self.val_combo = QComboBox()
+        self.val_combo.setToolTip(
+            "What the search is scored on -- which channel count is enough, "
+            "which epoch to keep. The tail of every training recording keeps "
+            "the test set independent at the cost of some training data; the "
+            "held-out recordings keep all data for training, but then their "
+            "score is a validation score, not a test.")
+        spl.add(self._labelled("Validation:", self.val_combo))
+        # the tail must hold two windows: 25% fits a 1 s window in a 10 s recording
+        spl.add(self._row("val_tail", "Validation share of each training recording (%):", "25"))
         spl.add(self._row("max_files", "Max files per group and class (empty = all):", ""))
         right.addWidget(spl)
 
@@ -4008,6 +4045,8 @@ class PrepareDialog(QDialog):
         self.class_combo.currentIndexChanged.connect(self._levels_changed)
         self.group_combo.currentIndexChanged.connect(self._levels_changed)
         self.test_combo.currentIndexChanged.connect(self._changed)
+        self.val_combo.currentIndexChanged.connect(self._val_changed)
+        self._fill_val_combo()
         self._apply_preset()
         if state:
             self._restore(state)
@@ -4198,6 +4237,7 @@ class PrepareDialog(QDialog):
             self.test_combo.addItem(f"hold out group  {g}", "group:" + g)
         i = self.test_combo.findData(keep) if keep else -1
         self.test_combo.setCurrentIndex(max(0, i))
+        self._fill_val_combo()
         self._loading = False
 
         cell = "padding:2px 10px 2px 0;"
@@ -4241,6 +4281,24 @@ class PrepareDialog(QDialog):
             self.out_edit.setText(os.path.normpath(d))
 
     # ------------------------------------------------------------------ config
+    def _fill_val_combo(self):
+        keep = self.val_combo.currentData()
+        self.val_combo.blockSignals(True)
+        self.val_combo.clear()
+        # item data is text, like the test combo ("group:<name>")
+        self.val_combo.addItem("tail of every training recording", "tail")
+        for g in getattr(self, "_groups", []):
+            self.val_combo.addItem(f"group  {g}", "group:" + g)
+        self.val_combo.addItem("the held-out recordings (no independent test)", "heldout")
+        i = self.val_combo.findData(keep) if keep else -1
+        self.val_combo.setCurrentIndex(max(0, i))
+        self.val_combo.blockSignals(False)
+        self._val_changed()
+
+    def _val_changed(self):
+        self._rows["val_tail"].setVisible(self.val_combo.currentData() == "tail")
+        self._changed()
+
     def _num(self, key, kind=int, optional=False):
         text = self._edits[key].text().strip().replace(",", ".")
         if not text:
@@ -4277,10 +4335,19 @@ class PrepareDialog(QDialog):
                   feature=feature, classes=classes, sr=sr,
                   class_level=self.class_combo.currentData(),
                   group_level=self.group_combo.currentData(),
-                  # the held-out recordings are also what the search is
-                  # scored on; nothing is cut off the training recordings
-                  val_from_test=True,
                   max_files=self._num("max_files", optional=True))
+        val = self.val_combo.currentData() or "tail"
+        if val == "heldout":
+            # the search is scored on the held-out recordings; nothing is cut
+            # off the training recordings, but no test stays independent
+            kw["val_from_test"] = True
+        elif val.startswith("group:"):
+            kw["val_groups"] = [val[len("group:"):]]
+        else:
+            share = self._num("val_tail", float)
+            if share >= 100:
+                raise ValueError("The validation share must be below 100%.")
+            kw["val_tail"] = share / 100.0
         if self._scan["tables"]:
             kw["input_sr"] = self._num("input_sr")
             kw["full_scale"] = self._num("full_scale", float, optional=True)
@@ -4399,6 +4466,7 @@ class PrepareDialog(QDialog):
                 "class_level": self.class_combo.currentData(),
                 "group_level": self.group_combo.currentData(),
                 "test": self.test_combo.currentData(),
+                "val": self.val_combo.currentData(),
                 "out": self.out_edit.text(), "out_auto": self._out_auto,
                 "input_sr_auto": self._input_sr_auto,
                 "bands_auto": self._bands_auto,
@@ -4426,6 +4494,10 @@ class PrepareDialog(QDialog):
         i = self.test_combo.findData(st.get("test")) if st.get("test") else -1
         if i >= 0:
             self.test_combo.setCurrentIndex(i)
+        i = self.val_combo.findData(st.get("val")) if st.get("val") else -1
+        if i >= 0:
+            self.val_combo.setCurrentIndex(i)
+        self._rows["val_tail"].setVisible(self.val_combo.currentData() == "tail")
         self._loading = False
 
 
